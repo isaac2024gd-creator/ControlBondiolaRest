@@ -20,15 +20,20 @@ import {
   CalendarClock,
   FileSignature,
   UploadCloud,
+  Wallet,
   Coins,
-  ChefHat,
-  PackagePlus,
+  ChevronLeft,
   ChevronRight,
+  Settings2,
+  AlertTriangle,
+  MapPin,
+  Building2,
+  Fingerprint,
+  Pencil,
 } from "lucide-react";
 
 /* ============================================================
-   CONFIGURACIÓN DE SUPABASE — PEGA AQUÍ TUS DATOS
-   Los obtienes en tu proyecto de Supabase: Settings → API
+   CONFIGURACIÓN DE SUPABASE — proyecto compartido con PAR
    ============================================================ */
 const SUPABASE_URL = "https://ciwfhbpcpygubsvtmwze.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_AF_54iVTwT25rhMrhWbFXQ_oW2z_NeF";
@@ -37,19 +42,20 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 /* Reemplazan a window.storage: usan la tabla kv_store_reloj_checador de Supabase
    (proyecto compartido con PAR, pero con tabla propia para no mezclar datos). */
-async function kvGet(key, tabla = "kv_store_reloj_checador") {
-  const { data, error } = await supabase.from(tabla).select("value").eq("key", key).maybeSingle();
+async function kvGet(key) {
+  const { data, error } = await supabase.from("kv_store_reloj_checador").select("value").eq("key", key).maybeSingle();
   if (error) throw error;
   return data ? data.value : null;
 }
 
-async function kvSet(key, value, tabla = "kv_store_reloj_checador") {
+async function kvSet(key, value) {
   const { error } = await supabase
-    .from(tabla)
+    .from("kv_store_reloj_checador")
     .upsert({ key, value, updated_at: new Date().toISOString() });
   if (error) throw error;
   return true;
 }
+
 
 // ---------- helpers ----------
 
@@ -130,6 +136,9 @@ function uid(prefix) {
 const DAY_NAMES = ["Domingo", "Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado"];
 const DAY_SHORT = ["Dom", "Lun", "Mar", "Mié", "Jue", "Vie", "Sáb"];
 
+const DEFAULT_AREAS = ["Cocina Caliente", "Cocina Fría", "Servicio", "Barra", "Almacén"];
+
+
 function defaultSchedule() {
   const sched = {};
   for (let i = 0; i < 7; i++) sched[i] = { enabled: false, start: "09:00", end: "17:00" };
@@ -156,39 +165,14 @@ function minutesLate(scheduledStart, punchIso) {
   const [h, m] = scheduledStart.split(":").map(Number);
   const scheduled = new Date(punch);
   scheduled.setHours(h, m, 0, 0);
-  // floor (no round): así todo el minuto 15 completo (15:00 a 15:59) cuenta como "15 min tarde",
-  // dentro de tolerancia — antes con Math.round, llegar a las 15:30 ya contaba como 16 y quedaba fuera.
-  return Math.floor((punch - scheduled) / 60000);
-}
-
-// Si no hay salida registrada y ya pasaron 1.5 horas del fin de turno programado,
-// se asume que la persona salió puntual (a la hora programada). Devuelve el ISO de esa
-// salida "asumida", o null si todavía estamos dentro de la ventana de tolerancia (no se asume nada aún).
-const TOLERANCIA_SALIDA_MIN = 90; // 1.5 horas
-
-function salidaAsumidaIso(dateKey, scheduledEnd) {
-  if (!scheduledEnd) return null;
-  const [y, mo, d] = dateKey.split("-").map(Number);
-  const [h, m] = scheduledEnd.split(":").map(Number);
-  const programada = new Date(y, mo - 1, d, h, m, 0, 0);
-  const limite = new Date(programada.getTime() + TOLERANCIA_SALIDA_MIN * 60000);
-  if (new Date() >= limite) return programada.toISOString();
-  return null;
-}
-
-// Áreas compartidas con DÍA/Limpieza — al registrar entrada se pregunta cuál se cubre hoy,
-// y se guarda en localStorage (mismo dispositivo) para que DÍA/Limpieza ya no la vuelvan a pedir.
-const AREAS_DIA = ["Cocina Caliente", "Cocina Fría", "Servicio PA", "Barra PB", "Almacén"];
-
-function guardarAreaCompartida(area) {
-  try { localStorage.setItem("dia_area_actual", area); } catch (e) {}
+  return Math.round((punch - scheduled) / 60000);
 }
 
 // clasifica la puntualidad según la tolerancia: 10 min para bono, 15 min para propinas
-function punctualityTier(mins) {
+function punctualityTier(mins, toleranciaBono = 10, toleranciaPropina = 15) {
   if (mins === null || mins === undefined) return null;
-  if (mins <= 10) return "bono";
-  if (mins <= 15) return "propina";
+  if (mins <= toleranciaBono) return "bono";
+  if (mins <= toleranciaPropina) return "propina";
   return "ninguno";
 }
 
@@ -230,6 +214,219 @@ function hoursBetween(entradaIso, salidaIso) {
   return Math.round((diffMs / 3600000) * 10) / 10; // 1 decimal
 }
 
+// ---------- nómina ----------
+
+function defaultPayroll() {
+  return {
+    rateType: "dia", // "dia" | "hora"
+    rateAmount: 0,
+    payPeriod: "semanal", // "semanal" | "quincenal" | "mensual"
+    bonoPorJornada: 0,
+    bonoFrecuencia: "dia", // "dia" | "semana" | "mes"
+    toleranciaBonoMin: 10,
+  };
+}
+
+function formatMoney(n) {
+  return (Number(n) || 0).toLocaleString("es-MX", { style: "currency", currency: "MXN" });
+}
+
+function defaultPeriodDates(payPeriod) {
+  const end = new Date();
+  const start = new Date();
+  if (payPeriod === "semanal") start.setDate(end.getDate() - 6);
+  else if (payPeriod === "quincenal") start.setDate(end.getDate() - 14);
+  else start.setDate(end.getDate() - 29);
+  return { start: localDateKey(start), end: localDateKey(end) };
+}
+
+// cuánto trabajó un empleado en un rango de fechas [startKey, endKey], usando sus
+// registros reales de entrada/salida — incluye días/horas y elegibilidad de bono/propina
+function computeWorkedInRange(employeeId, startKey, endKey, recordsByDate) {
+  const dates = Object.keys(recordsByDate)
+    .filter((d) => d >= startKey && d <= endKey)
+    .sort();
+  let totalHoras = 0;
+  let totalDias = 0;
+  let diasBono = 0;
+  let diasPropina = 0; // cuenta días en tier 'bono' o 'propina' (ambos dan derecho a propina)
+
+  dates.forEach((dateKey) => {
+    const dayRecords = (recordsByDate[dateKey] || []).filter((r) => r.employeeId === employeeId);
+    const entrada = dayRecords.find((r) => r.type === "entrada");
+    const salida = [...dayRecords].reverse().find((r) => r.type === "salida");
+    if (!entrada) return;
+    totalDias += 1;
+    if (entrada.punctuality === "bono") {
+      diasBono += 1;
+      diasPropina += 1;
+    } else if (entrada.punctuality === "propina") {
+      diasPropina += 1;
+    }
+    if (salida) {
+      const h = hoursBetween(entrada.time, salida.time);
+      if (h) totalHoras += h;
+    }
+  });
+
+  return { totalHoras: Math.round(totalHoras * 10) / 10, totalDias, diasBono, diasPropina };
+}
+
+// días dentro del rango en los que el empleado NO checó entrada — candidatos a marcar
+// como vacaciones tomadas (o simplemente días libres, sin registro alguno)
+function getNonWorkedDaysInRange(employeeId, startKey, endKey, recordsByDate) {
+  const dias = [];
+  const start = new Date(startKey + "T00:00:00");
+  const end = new Date(endKey + "T00:00:00");
+  if (isNaN(start) || isNaN(end) || start > end) return dias;
+  for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+    const key = localDateKey(d);
+    const trabajado = (recordsByDate[key] || []).some((r) => r.employeeId === employeeId && r.type === "entrada");
+    if (!trabajado) dias.push({ key, weekday: DAY_SHORT[d.getDay()] });
+  }
+  return dias;
+}
+
+// total de días elegibles para propina de TODO el personal activo en el mismo rango,
+// para poder prorratear la bolsa de propinas del periodo
+function computeTotalEligibleDiasPropina(startKey, endKey, employees, recordsByDate) {
+  return employees.reduce((sum, emp) => {
+    const w = computeWorkedInRange(emp.id, startKey, endKey, recordsByDate);
+    return sum + w.diasPropina;
+  }, 0);
+}
+
+// clave del "bucket" (día/semana/mes) al que pertenece una fecha, según la frecuencia del bono
+function bonoBucketKey(dateKey, frecuencia) {
+  if (frecuencia === "dia") return dateKey;
+  const d = new Date(dateKey + "T00:00:00");
+  if (frecuencia === "semana") {
+    const dom = new Date(d);
+    dom.setDate(dom.getDate() - dom.getDay()); // domingo de esa semana
+    return localDateKey(dom);
+  }
+  return dateKey.slice(0, 7); // "mes": YYYY-MM
+}
+
+// cuántas "unidades" de bono ganó el empleado en el rango, según la frecuencia:
+// por día = cada día puntual cuenta; por semana/mes = solo cuenta si TODOS los días
+// trabajados de ese bucket calificaron para bono (ni uno fuera de tolerancia)
+function computeBonoUnits(employeeId, startKey, endKey, recordsByDate, frecuencia) {
+  if (frecuencia === "dia") {
+    return computeWorkedInRange(employeeId, startKey, endKey, recordsByDate).diasBono;
+  }
+  const dates = Object.keys(recordsByDate)
+    .filter((d) => d >= startKey && d <= endKey)
+    .sort();
+  const buckets = {};
+  dates.forEach((dateKey) => {
+    const entrada = (recordsByDate[dateKey] || []).find((r) => r.employeeId === employeeId && r.type === "entrada");
+    if (!entrada) return;
+    const key = bonoBucketKey(dateKey, frecuencia);
+    if (!buckets[key]) buckets[key] = { totalDias: 0, diasBono: 0 };
+    buckets[key].totalDias += 1;
+    if (entrada.punctuality === "bono") buckets[key].diasBono += 1;
+  });
+  return Object.values(buckets).filter((b) => b.totalDias > 0 && b.diasBono === b.totalDias).length;
+}
+
+function computePayrollTotals(draft, worked, bonoUnits, propinaMonto) {
+  const base = draft.rateType === "hora" ? worked.totalHoras * draft.rateAmount : worked.totalDias * draft.rateAmount;
+  const bono = draft.enableBono ? (bonoUnits || 0) * draft.bonoPorJornada : 0;
+  const propina = draft.enablePropina ? propinaMonto || 0 : 0;
+  const vacaciones = draft.enableVacaciones ? (draft.vacacionesFechas || []).length * draft.rateAmount : 0;
+  const descuentos = draft.enableDescuentos
+    ? (draft.descuentos || []).reduce((s, d) => s + (Number(d.amount) || 0), 0)
+    : 0;
+  const consumo = draft.enableConsumo
+    ? (draft.consumo || []).reduce((s, d) => s + (Number(d.amount) || 0), 0)
+    : 0;
+  const bruto = base + bono + propina + vacaciones;
+  const leyDeduccion = draft.enableLey ? bruto * ((Number(draft.leyPercent) || 0) / 100) : 0;
+  const neto = bruto - leyDeduccion - descuentos - consumo;
+  return { base, bono, propina, vacaciones, descuentos, consumo, bruto, leyDeduccion, neto };
+}
+
+// ---------- propinas del periodo (día, semana o mes) ----------
+// reparte un monto entre quienes trabajaron en el rango, proporcional a sus días elegibles
+// (bono o propina) dentro de ese rango — para un solo día, esto equivale al reparto 50/50
+// de antes; para semana/mes, cada quien recibe según cuántos días le tocó calificar.
+// Usa matemática de centavos enteros para que el redondeo sea siempre exacto y hacia abajo.
+// Nota: las correcciones manuales de puntualidad se aplican directo al registro de la
+// entrada (ver aplicarCorreccionManual), así que este cálculo ya las ve automáticamente
+// sin necesitar un overlay aparte.
+function calcularRepartoPropinas(startKey, endKey, monto, employees, recordsByDate, externosPorDia) {
+  const candidatos = employees
+    .map((emp) => {
+      const w = computeWorkedInRange(emp.id, startKey, endKey, recordsByDate);
+      const tieneCorreccion = Object.keys(recordsByDate)
+        .filter((d) => d >= startKey && d <= endKey)
+        .some((d) => (recordsByDate[d] || []).some((r) => r.employeeId === emp.id && r.type === "entrada" && r.correccionManual));
+      return {
+        employeeId: emp.id,
+        employeeName: emp.name,
+        diasTrabajados: w.totalDias,
+        diasPropina: w.diasPropina,
+        califica: w.diasPropina > 0,
+        tieneCorreccion,
+        tipo: "empleado",
+      };
+    })
+    .filter((c) => c.diasTrabajados > 0);
+
+  // Agregar externos al cálculo
+  const externosEnRango = (externosPorDia || []).filter((e) => e.fecha >= startKey && e.fecha <= endKey);
+  const externoPorId = {};
+  for (const ext of externosEnRango) {
+    if (!externoPorId[ext.externoId]) {
+      externoPorId[ext.externoId] = { externoId: ext.externoId, nombre: ext.nombre, diasTrabajados: 0, diasPropina: 0 };
+    }
+    externoPorId[ext.externoId].diasTrabajados++;
+    externoPorId[ext.externoId].diasPropina++;
+  }
+  const externoCandidatos = Object.values(externoPorId).map((ext) => ({
+    employeeId: ext.externoId,
+    employeeName: ext.nombre,
+    diasTrabajados: ext.diasTrabajados,
+    diasPropina: ext.diasPropina,
+    califica: ext.diasPropina > 0,
+    tieneCorreccion: false,
+    tipo: "externo",
+  }));
+
+  const todosCandidatos = [...candidatos, ...externoCandidatos];
+  const totalDiasPropina = todosCandidatos.reduce((s, c) => s + c.diasPropina, 0);
+  const montoCentavos = Math.round((Number(monto) || 0) * 100);
+
+  const lista = todosCandidatos
+    .map((c) => {
+      const centavos = totalDiasPropina > 0 ? Math.floor((montoCentavos * c.diasPropina) / totalDiasPropina) : 0;
+      return { ...c, monto: centavos / 100 };
+    })
+    .sort((a, b) => (b.califica === a.califica ? a.employeeName.localeCompare(b.employeeName) : b.califica ? 1 : -1));
+
+  const repartidoCentavos = lista.reduce((s, l) => s + Math.round(l.monto * 100), 0);
+  const sobrante = (montoCentavos - repartidoCentavos) / 100;
+
+  return { lista, sobrante };
+}
+
+// suma lo que a un empleado le tocó en los repartos de Propinas ya guardados,
+// cuyo rango cae dentro del periodo de nómina — así la nómina no duplica el cálculo,
+// solo recoge lo que ya se repartió.
+function sumPropinaFromHistorial(employeeId, periodStart, periodEnd, propinasHistorial) {
+  return propinasHistorial
+    .filter((p) => {
+      const inicio = p.fechaInicio || p.fecha;
+      const fin = p.fechaFin || p.fecha;
+      return inicio >= periodStart && fin <= periodEnd;
+    })
+    .reduce((sum, p) => {
+      const linea = (p.reparto || []).find((r) => r.employeeId === employeeId);
+      return sum + (linea ? Number(linea.monto) || 0 : 0);
+    }, 0);
+}
+
 // cruza el horario VIGENTE en cada fecha (no siempre el actual) contra los registros reales del mes
 function buildEmployeeMonthReport(emp, monthKeyStr, recordsByDate) {
   const [year, month] = monthKeyStr.split("-").map(Number);
@@ -248,10 +445,7 @@ function buildEmployeeMonthReport(emp, monthKeyStr, recordsByDate) {
 
     if (!scheduled && !entrada && !salida) continue; // día sin relevancia para este empleado
 
-    // si no hay salida real y ya se cumplió la tolerancia de 1.5h, se asume que salió a tiempo
-    const salidaAsumida = !salida && scheduled && daySchedule?.end ? salidaAsumidaIso(dateKey, daySchedule.end) : null;
-    const salidaEfectivaIso = salida ? salida.time : salidaAsumida;
-    const hoursWorked = entrada && salidaEfectivaIso ? hoursBetween(entrada.time, salidaEfectivaIso) : null;
+    const hoursWorked = entrada && salida ? hoursBetween(entrada.time, salida.time) : null;
 
     rows.push({
       dateKey,
@@ -262,7 +456,7 @@ function buildEmployeeMonthReport(emp, monthKeyStr, recordsByDate) {
       scheduledStart: daySchedule?.start || null,
       scheduledEnd: daySchedule?.end || null,
       entradaTime: entrada ? formatTime(entrada.time) : null,
-      salidaTime: salida ? formatTime(salida.time) : salidaAsumida ? `${formatTime(salidaAsumida)} (auto)` : null,
+      salidaTime: salida ? formatTime(salida.time) : null,
       punctuality: entrada?.punctuality || null,
       minutesLate: entrada?.minutesLate ?? null,
       falta: scheduled && !entrada,
@@ -306,7 +500,10 @@ function escapeHtml(str) {
 
 // arma un documento HTML autocontenido (sin dependencias externas) con el resumen del mes,
 // listo para descargar, abrir en cualquier navegador e imprimir/guardar como PDF
-function buildMonthSummaryHtml(monthKeyStr, employees, recordsByDate) {
+function buildMonthSummaryHtml(monthKeyStr, employees, recordsByDate, businessConfig) {
+  const bizName = escapeHtml(businessConfig?.nombre || "Restaurante");
+  const bizLine = [businessConfig?.direccion, businessConfig?.encabezado].filter(Boolean).map(escapeHtml).join(" · ");
+
   const reportsToShow = employees
     .map((emp) => ({ emp, report: buildEmployeeMonthReport(emp, monthKeyStr, recordsByDate) }))
     .filter(({ report }) => report.rows.length > 0);
@@ -327,7 +524,7 @@ function buildMonthSummaryHtml(monthKeyStr, employees, recordsByDate) {
       ({ emp, report }) => `
     <section class="report-page">
       <h1>Resumen mensual de asistencia</h1>
-      <p class="subtitle">Restaurante Bondiola · ${escapeHtml(monthLabel(monthKeyStr))}</p>
+      <p class="subtitle">${bizName}${bizLine ? " · " + bizLine : ""} · ${escapeHtml(monthLabel(monthKeyStr))}</p>
       <div class="meta">
         <div><strong>Empleado:</strong> ${escapeHtml(emp.name)}</div>
         <div><strong>Puesto:</strong> ${escapeHtml(emp.puesto)}</div>
@@ -489,17 +686,713 @@ async function deletePhotoLocal(id) {
   }
 }
 
+// ---------- reconocimiento biométrico (huella / rostro) vía WebAuthn ----------
+// No hay servidor propio que verifique firmas criptográficas — esto usa el lector
+// biométrico del sistema operativo del dispositivo (Face ID, Touch ID, huella en Android/
+// Windows) en modo "confianza local": si el sistema operativo confirma la huella/rostro
+// correcto para la credencial guardada de esa persona EN ESTE DISPOSITIVO, se acepta.
+// Por diseño está atado al dispositivo donde se registró — perfecto para un equipo fijo,
+// pero cada persona debe registrarse de nuevo si algún día se usa en otro dispositivo.
+
+function isWebAuthnSupported() {
+  return typeof window !== "undefined" && !!window.PublicKeyCredential;
+}
+
+function bufToBase64url(buf) {
+  const bytes = new Uint8Array(buf);
+  let str = "";
+  for (let i = 0; i < bytes.length; i++) str += String.fromCharCode(bytes[i]);
+  return btoa(str).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function base64urlToBuf(str) {
+  const b64 = str.replace(/-/g, "+").replace(/_/g, "/").padEnd(str.length + ((4 - (str.length % 4)) % 4), "=");
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes.buffer;
+}
+
+function randomChallenge() {
+  const arr = new Uint8Array(32);
+  crypto.getRandomValues(arr);
+  return arr;
+}
+
+async function enrollBiometric(employeeId, employeeName, businessName) {
+  const idBytes = new TextEncoder().encode(employeeId).slice(0, 64);
+  const credential = await navigator.credentials.create({
+    publicKey: {
+      challenge: randomChallenge(),
+      rp: { name: businessName || "Reloj Checador" },
+      user: { id: idBytes, name: employeeName, displayName: employeeName },
+      pubKeyCredParams: [
+        { type: "public-key", alg: -7 }, // ES256
+        { type: "public-key", alg: -257 }, // RS256
+      ],
+      authenticatorSelection: { authenticatorAttachment: "platform", userVerification: "required" },
+      timeout: 60000,
+    },
+  });
+  if (!credential) throw new Error("No se pudo registrar");
+  return bufToBase64url(credential.rawId);
+}
+
+async function verifyBiometric(credentialIdBase64url) {
+  const assertion = await navigator.credentials.get({
+    publicKey: {
+      challenge: randomChallenge(),
+      allowCredentials: [{ id: base64urlToBuf(credentialIdBase64url), type: "public-key" }],
+      userVerification: "required",
+      timeout: 60000,
+    },
+  });
+  return !!assertion;
+}
+
 // ---------- main component ----------
+
+// ---------- panel de nómina por empleado ----------
+
+function ToggleRow({ label, checked, onChange, colors }) {
+  const { ink, sage, steel } = colors;
+  return (
+    <button
+      onClick={() => onChange(!checked)}
+      className="w-full flex items-center justify-between px-3 py-2 rounded-sm"
+      style={{ background: checked ? sage + "14" : ink + "06", border: `1px solid ${checked ? sage + "55" : ink + "11"}` }}
+    >
+      <span className="text-xs font-bold" style={{ color: ink }}>
+        {label}
+      </span>
+      <span
+        className="rounded-full flex-shrink-0"
+        style={{
+          width: 30,
+          height: 17,
+          background: checked ? sage : steel + "55",
+          position: "relative",
+          transition: "background 0.15s",
+        }}
+      >
+        <span
+          className="rounded-full absolute"
+          style={{
+            width: 13,
+            height: 13,
+            top: 2,
+            left: checked ? 15 : 2,
+            background: "#fff",
+            transition: "left 0.15s",
+          }}
+        />
+      </span>
+    </button>
+  );
+}
+
+function LineItemsEditor({ items, onAdd, onUpdate, onRemove, colors, placeholder }) {
+  const { ink } = colors;
+  return (
+    <div className="mt-2 flex flex-col gap-1.5">
+      {(items || []).map((item, idx) => (
+        <div key={idx} className="flex items-center gap-1.5">
+          <input
+            value={item.label}
+            onChange={(e) => onUpdate(idx, { label: e.target.value })}
+            placeholder={placeholder}
+            className="flex-1 px-2 py-1.5 rounded-sm text-xs outline-none"
+            style={{ border: `1px solid ${ink}33`, background: "#fff", color: ink }}
+          />
+          <input
+            value={item.amount}
+            onChange={(e) => onUpdate(idx, { amount: e.target.value.replace(/[^0-9.]/g, "") })}
+            placeholder="$"
+            inputMode="decimal"
+            className="w-20 px-2 py-1.5 rounded-sm text-xs outline-none"
+            style={{ border: `1px solid ${ink}33`, background: "#fff", color: ink }}
+          />
+          <button onClick={() => onRemove(idx)} className="p-1.5 flex-shrink-0" style={{ color: ink + "55" }}>
+            <Trash2 size={13} />
+          </button>
+        </div>
+      ))}
+      <button onClick={onAdd} className="flex items-center gap-1 text-[11px] font-bold self-start" style={{ color: ink + "88" }}>
+        <Plus size={12} /> Agregar línea
+      </button>
+    </div>
+  );
+}
+
+function PayrollPanel({
+  employee,
+  draft,
+  employees,
+  recordsByDate,
+  propinasHistorial,
+  propinasConfig,
+  onBack,
+  onChange,
+  onAddLine,
+  onUpdateLine,
+  onRemoveLine,
+  onSaveConfig,
+  onGenerate,
+  colors,
+}) {
+  const { paprika, sage, ink, paper, brass, steel } = colors;
+  if (!employee || !draft) return null;
+
+  const worked = computeWorkedInRange(employee.id, draft.periodStart, draft.periodEnd, recordsByDate);
+  const bonoUnits = draft.enableBono
+    ? computeBonoUnits(employee.id, draft.periodStart, draft.periodEnd, recordsByDate, draft.bonoFrecuencia || "dia")
+    : 0;
+  // la propina ya NO se captura a mano: se suma sola de lo que Propinas ya repartió y
+  // guardó para este empleado dentro del periodo de nómina
+  const propinaAuto = draft.enablePropina
+    ? sumPropinaFromHistorial(employee.id, draft.periodStart, draft.periodEnd, propinasHistorial)
+    : 0;
+  const propinaSeSuma = draft.enablePropina && propinasConfig.modoEntrega === "nomina";
+  const totals = computePayrollTotals(draft, worked, bonoUnits, propinaSeSuma ? propinaAuto : 0);
+  const bonoLabel =
+    draft.bonoFrecuencia === "semana" ? "semana perfecta" : draft.bonoFrecuencia === "mes" ? "mes perfecto" : "jornada";
+  const mostrarLineaBono = draft.enableBono && (draft.rateType !== "dia" || totals.bono > 0);
+  const diasNoTrabajados = draft.enableVacaciones
+    ? getNonWorkedDaysInRange(employee.id, draft.periodStart, draft.periodEnd, recordsByDate)
+    : [];
+
+  return (
+    <div className="flex-1 overflow-y-auto flex flex-col gap-4 pb-4">
+      <div className="flex items-center justify-between">
+        <button onClick={onBack} className="flex items-center gap-1 text-xs font-bold" style={{ color: paper }}>
+          <ChevronLeft size={15} /> Personal
+        </button>
+        <div className="text-sm font-black" style={{ color: paper }}>
+          {employee.name}
+        </div>
+      </div>
+
+      {/* configuración de pago */}
+      <div className="rounded-sm p-4" style={{ background: paper }}>
+        <div className="flex items-center gap-1.5 mb-3">
+          <Settings2 size={13} color={ink} />
+          <div className="text-[11px] font-bold uppercase" style={{ color: ink, letterSpacing: "0.05em" }}>
+            Configuración de pago
+          </div>
+        </div>
+        <div className="grid grid-cols-2 gap-2 mb-2">
+          <button
+            onClick={() => onChange({ rateType: "dia" })}
+            className="py-2 rounded-sm text-xs font-bold uppercase"
+            style={{
+              background: draft.rateType === "dia" ? brass : "transparent",
+              border: `1px solid ${draft.rateType === "dia" ? brass : ink + "33"}`,
+              color: ink,
+            }}
+          >
+            Por jornada/día
+          </button>
+          <button
+            onClick={() => onChange({ rateType: "hora" })}
+            className="py-2 rounded-sm text-xs font-bold uppercase"
+            style={{
+              background: draft.rateType === "hora" ? brass : "transparent",
+              border: `1px solid ${draft.rateType === "hora" ? brass : ink + "33"}`,
+              color: ink,
+            }}
+          >
+            Por hora
+          </button>
+        </div>
+        <div className="flex items-center gap-2 mb-2">
+          <span className="text-xs" style={{ color: ink + "88" }}>
+            Monto por {draft.rateType === "hora" ? "hora" : "jornada"}:
+          </span>
+          <input
+            value={draft.rateAmount}
+            onChange={(e) => onChange({ rateAmount: e.target.value.replace(/[^0-9.]/g, "") })}
+            placeholder="0.00"
+            inputMode="decimal"
+            className="flex-1 px-2 py-1.5 rounded-sm text-xs outline-none"
+            style={{ border: `1px solid ${ink}33`, background: "#fff", color: ink }}
+          />
+        </div>
+        <div className="flex items-center gap-2 mb-3">
+          <span className="text-xs" style={{ color: ink + "88" }}>
+            Periodo de pago:
+          </span>
+          <select
+            value={draft.payPeriod}
+            onChange={(e) => onChange({ payPeriod: e.target.value })}
+            className="flex-1 px-2 py-1.5 rounded-sm text-xs outline-none"
+            style={{ border: `1px solid ${ink}33`, background: "#fff", color: ink }}
+          >
+            <option value="semanal">Semanal</option>
+            <option value="quincenal">Quincenal</option>
+            <option value="mensual">Mensual</option>
+          </select>
+        </div>
+        <button
+          onClick={onSaveConfig}
+          className="w-full py-2 rounded-sm font-bold text-xs uppercase"
+          style={{ border: `1px solid ${ink}33`, color: ink }}
+        >
+          Guardar como configuración de {employee.name.split(" ")[0]}
+        </button>
+      </div>
+
+      {/* periodo a calcular */}
+      <div className="rounded-sm p-4" style={{ background: paper }}>
+        <div className="text-[11px] font-bold uppercase mb-3" style={{ color: ink, letterSpacing: "0.05em" }}>
+          Periodo a calcular
+        </div>
+        <div className="flex items-center gap-2 mb-3">
+          <input
+            type="date"
+            value={draft.periodStart}
+            onChange={(e) => onChange({ periodStart: e.target.value })}
+            className="flex-1 px-2 py-1.5 rounded-sm text-xs outline-none"
+            style={{ border: `1px solid ${ink}33`, background: "#fff", color: ink }}
+          />
+          <span className="text-[10px]" style={{ color: ink + "66" }}>
+            a
+          </span>
+          <input
+            type="date"
+            value={draft.periodEnd}
+            onChange={(e) => onChange({ periodEnd: e.target.value })}
+            className="flex-1 px-2 py-1.5 rounded-sm text-xs outline-none"
+            style={{ border: `1px solid ${ink}33`, background: "#fff", color: ink }}
+          />
+        </div>
+        <div className="grid grid-cols-2 gap-2 text-xs" style={{ color: ink }}>
+          <div>
+            Días trabajados: <strong>{worked.totalDias}</strong>
+          </div>
+          <div>
+            Horas trabajadas: <strong>{worked.totalHoras}</strong>
+          </div>
+          <div>
+            Días con bono: <strong>{worked.diasBono}</strong>
+          </div>
+          <div>
+            Días con propina: <strong>{worked.diasPropina}</strong>
+          </div>
+        </div>
+      </div>
+
+      {/* opciones */}
+      <div className="rounded-sm p-4 flex flex-col gap-2" style={{ background: paper }}>
+        <div className="text-[11px] font-bold uppercase mb-1" style={{ color: ink, letterSpacing: "0.05em" }}>
+          Opciones
+        </div>
+
+        <ToggleRow label="Bono por puntualidad" checked={draft.enableBono} onChange={(v) => onChange({ enableBono: v })} colors={colors} />
+        {draft.enableBono && (
+          <div className="pl-1 flex flex-col gap-2">
+            <div className="flex items-center gap-2">
+              <span className="text-[11px]" style={{ color: ink + "88" }}>
+                Frecuencia:
+              </span>
+              <select
+                value={draft.bonoFrecuencia || "dia"}
+                onChange={(e) => onChange({ bonoFrecuencia: e.target.value })}
+                className="flex-1 px-2 py-1.5 rounded-sm text-xs outline-none"
+                style={{ border: `1px solid ${ink}33`, background: "#fff", color: ink }}
+              >
+                <option value="dia">Por día</option>
+                <option value="semana">Por semana</option>
+                <option value="mes">Por mes</option>
+              </select>
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="text-[11px]" style={{ color: ink + "88" }}>
+                Monto por {bonoLabel}:
+              </span>
+              <input
+                value={draft.bonoPorJornada}
+                onChange={(e) => onChange({ bonoPorJornada: e.target.value.replace(/[^0-9.]/g, "") })}
+                inputMode="decimal"
+                className="flex-1 px-2 py-1.5 rounded-sm text-xs outline-none"
+                style={{ border: `1px solid ${ink}33`, background: "#fff", color: ink }}
+              />
+            </div>
+            {draft.bonoFrecuencia && draft.bonoFrecuencia !== "dia" && (
+              <p className="text-[10px]" style={{ color: ink + "66" }}>
+                Solo cuenta como {draft.bonoFrecuencia === "semana" ? "semana" : "mes"} perfecta si ningún
+                día trabajado quedó fuera de la tolerancia de bono.
+              </p>
+            )}
+
+            <div className="mt-1 pt-2" style={{ borderTop: `1px dashed ${ink}22` }}>
+              <p className="text-[10px] font-bold uppercase mb-1.5" style={{ color: ink + "88" }}>
+                Tolerancia de bono (afecta al Checador en vivo)
+              </p>
+              <div className="flex items-center gap-2">
+                <span className="text-[11px] flex-1" style={{ color: ink + "88" }}>
+                  Minutos para bono:
+                </span>
+                <input
+                  value={draft.toleranciaBonoMin}
+                  onChange={(e) => onChange({ toleranciaBonoMin: e.target.value.replace(/[^0-9]/g, "") })}
+                  inputMode="numeric"
+                  className="w-16 px-2 py-1.5 rounded-sm text-xs outline-none"
+                  style={{ border: `1px solid ${ink}33`, background: "#fff", color: ink }}
+                />
+              </div>
+              <p className="text-[10px] mt-1.5" style={{ color: brass }}>
+                Al guardar, esta tolerancia queda vigente para las próximas entradas de {employee.name} en
+                el Checador.
+              </p>
+              <p className="text-[10px] mt-1" style={{ color: ink + "66" }}>
+                La tolerancia de propina ahora se configura desde la pestaña Propinas.
+              </p>
+            </div>
+          </div>
+        )}
+
+        <ToggleRow label="Reparto de propina" checked={draft.enablePropina} onChange={(v) => onChange({ enablePropina: v })} colors={colors} />
+        {draft.enablePropina && (
+          <div className="pl-1">
+            <div className="flex items-center justify-between px-3 py-2 rounded-sm" style={{ background: sage + "14" }}>
+              <span className="text-[11px]" style={{ color: ink + "88" }}>
+                Propina de {employee.name} este periodo (automático):
+              </span>
+              <span className="text-sm font-bold" style={{ color: sage }}>
+                {formatMoney(propinaAuto)}
+              </span>
+            </div>
+            <p className="text-[10px] mt-1.5" style={{ color: ink + "66" }}>
+              Se toma de lo ya guardado en Propinas para las fechas de este periodo — no se captura a
+              mano aquí.
+            </p>
+            {propinasConfig.modoEntrega === "nomina" ? (
+              <p className="text-[10px] mt-1" style={{ color: sage }}>
+                Entrega configurada como "junto con la nómina": este monto se suma al neto de abajo.
+              </p>
+            ) : (
+              <p className="text-[10px] mt-1" style={{ color: brass }}>
+                Entrega configurada como "diaria e independiente" en Propinas: este monto es solo
+                informativo, ya se le pagó aparte y NO se suma al neto. Cámbialo en la pestaña Propinas
+                si quieres que sí se sume.
+              </p>
+            )}
+          </div>
+        )}
+
+        <ToggleRow label="Vacaciones" checked={draft.enableVacaciones} onChange={(v) => onChange({ enableVacaciones: v })} colors={colors} />
+        {draft.enableVacaciones && (
+          <div className="pl-1">
+            {diasNoTrabajados.length === 0 ? (
+              <p className="text-[11px]" style={{ color: ink + "66" }}>
+                No hay días sin checar dentro de este periodo — no hay nada que marcar como
+                vacaciones.
+              </p>
+            ) : (
+              <>
+                <p className="text-[11px] mb-1.5" style={{ color: ink + "88" }}>
+                  ¿Cuál de estos días sin checar fue tomado como vacaciones?
+                </p>
+                <div className="flex flex-wrap gap-1.5">
+                  {diasNoTrabajados.map((d) => {
+                    const marcado = (draft.vacacionesFechas || []).includes(d.key);
+                    return (
+                      <button
+                        key={d.key}
+                        onClick={() => {
+                          const actuales = draft.vacacionesFechas || [];
+                          onChange({
+                            vacacionesFechas: marcado ? actuales.filter((f) => f !== d.key) : [...actuales, d.key],
+                          });
+                        }}
+                        className="px-2.5 py-1.5 rounded-sm text-[11px] font-bold"
+                        style={{
+                          background: marcado ? sage : "transparent",
+                          color: marcado ? paper : ink,
+                          border: `1px solid ${marcado ? sage : ink + "33"}`,
+                        }}
+                      >
+                        {d.weekday} {d.key.slice(8, 10)}
+                      </button>
+                    );
+                  })}
+                </div>
+              </>
+            )}
+            {(draft.vacacionesFechas || []).length > 0 && (
+              <p className="text-[10px] mt-1.5" style={{ color: sage }}>
+                {draft.vacacionesFechas.length} día(s) marcado(s) como vacaciones ={" "}
+                {formatMoney(draft.vacacionesFechas.length * (Number(draft.rateAmount) || 0))}.
+              </p>
+            )}
+          </div>
+        )}
+
+        <ToggleRow
+          label="Descuentos y penalizaciones"
+          checked={draft.enableDescuentos}
+          onChange={(v) => onChange({ enableDescuentos: v })}
+          colors={colors}
+        />
+        {draft.enableDescuentos && (
+          <LineItemsEditor
+            items={draft.descuentos}
+            onAdd={() => onAddLine("descuentos")}
+            onUpdate={(idx, patch) => onUpdateLine("descuentos", idx, patch)}
+            onRemove={(idx) => onRemoveLine("descuentos", idx)}
+            colors={colors}
+            placeholder="Motivo (ej. retardo, material dañado)"
+          />
+        )}
+
+        <ToggleRow
+          label="Consumo en el local"
+          checked={draft.enableConsumo}
+          onChange={(v) => onChange({ enableConsumo: v })}
+          colors={colors}
+        />
+        {draft.enableConsumo && (
+          <LineItemsEditor
+            items={draft.consumo}
+            onAdd={() => onAddLine("consumo")}
+            onUpdate={(idx, patch) => onUpdateLine("consumo", idx, patch)}
+            onRemove={(idx) => onRemoveLine("consumo", idx)}
+            colors={colors}
+            placeholder="Qué consumió"
+          />
+        )}
+
+        <ToggleRow
+          label="Descuentos de ley (simplificado)"
+          checked={draft.enableLey}
+          onChange={(v) => onChange({ enableLey: v })}
+          colors={colors}
+        />
+        {draft.enableLey && (
+          <div className="pl-1">
+            <div className="flex items-center gap-2">
+              <span className="text-[11px]" style={{ color: ink + "88" }}>
+                % a descontar del bruto:
+              </span>
+              <input
+                value={draft.leyPercent}
+                onChange={(e) => onChange({ leyPercent: e.target.value.replace(/[^0-9.]/g, "") })}
+                inputMode="decimal"
+                className="flex-1 px-2 py-1.5 rounded-sm text-xs outline-none"
+                style={{ border: `1px solid ${ink}33`, background: "#fff", color: ink }}
+              />
+            </div>
+            <p className="text-[10px] mt-1 flex items-start gap-1" style={{ color: paprika }}>
+              <AlertTriangle size={11} className="flex-shrink-0 mt-0.5" />
+              Esto es un porcentaje simple, no un cálculo real de ISR/IMSS. Antes de usarlo con nómina de
+              verdad, valídalo con tu contador.
+            </p>
+          </div>
+        )}
+      </div>
+
+      {/* resumen */}
+      <div className="rounded-sm p-4" style={{ background: paper }}>
+        <div className="text-[11px] font-bold uppercase mb-3" style={{ color: ink, letterSpacing: "0.05em" }}>
+          Resumen
+        </div>
+        <div className="flex flex-col gap-1 text-xs" style={{ color: ink }}>
+          <div className="flex justify-between">
+            <span>Pago base</span>
+            <span>{formatMoney(totals.base)}</span>
+          </div>
+          {mostrarLineaBono && (
+            <div className="flex justify-between">
+              <span>Bono</span>
+              <span>+{formatMoney(totals.bono)}</span>
+            </div>
+          )}
+          {draft.enablePropina && (
+            <div className="flex justify-between">
+              <span>Propina</span>
+              <span>+{formatMoney(totals.propina)}</span>
+            </div>
+          )}
+          {draft.enableVacaciones && (
+            <div className="flex justify-between">
+              <span>Vacaciones</span>
+              <span>+{formatMoney(totals.vacaciones)}</span>
+            </div>
+          )}
+          <div className="flex justify-between font-bold pt-1" style={{ borderTop: `1px solid ${ink}22` }}>
+            <span>Bruto</span>
+            <span>{formatMoney(totals.bruto)}</span>
+          </div>
+          {draft.enableLey && (
+            <div className="flex justify-between" style={{ color: paprika }}>
+              <span>Descuento de ley</span>
+              <span>-{formatMoney(totals.leyDeduccion)}</span>
+            </div>
+          )}
+          {draft.enableDescuentos && (
+            <div className="flex justify-between" style={{ color: paprika }}>
+              <span>Descuentos/penalizaciones</span>
+              <span>-{formatMoney(totals.descuentos)}</span>
+            </div>
+          )}
+          {draft.enableConsumo && (
+            <div className="flex justify-between" style={{ color: paprika }}>
+              <span>Consumo en el local</span>
+              <span>-{formatMoney(totals.consumo)}</span>
+            </div>
+          )}
+          <div className="flex justify-between font-black text-base pt-2 mt-1" style={{ borderTop: `2px solid ${ink}33`, color: sage }}>
+            <span>Neto a pagar</span>
+            <span>{formatMoney(totals.neto)}</span>
+          </div>
+        </div>
+
+        <button
+          onClick={() => onGenerate(worked, totals)}
+          className="w-full flex items-center justify-center gap-2 py-3 mt-4 rounded-sm font-bold text-sm uppercase"
+          style={{ background: brass, color: ink }}
+        >
+          <FileSignature size={15} /> Generar recibo imprimible
+        </button>
+      </div>
+    </div>
+  );
+}
 
 export default function RelojChecador() {
   const [tab, setTab] = useState("checador");
 
   const [employees, setEmployees] = useState([]);
-  const [asignaciones, setAsignaciones] = useState([]); // quién cubre cada área hoy
   const [loadingEmployees, setLoadingEmployees] = useState(true);
   const [newName, setNewName] = useState("");
   const [newPuesto, setNewPuesto] = useState("");
   const [confirmDeleteId, setConfirmDeleteId] = useState(null);
+
+  // ---------- lista de áreas del local (configurable, ya no fija) ----------
+  const [areasList, setAreasList] = useState(DEFAULT_AREAS);
+  const [loadingAreas, setLoadingAreas] = useState(true);
+  const [newAreaName, setNewAreaName] = useState("");
+  const [editingAreaIdx, setEditingAreaIdx] = useState(null);
+  const [editingAreaValue, setEditingAreaValue] = useState("");
+  const [confirmDeleteAreaIdx, setConfirmDeleteAreaIdx] = useState(null);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const r = await storageGet("areas_config");
+        setAreasList(r ? JSON.parse(r.value) : DEFAULT_AREAS);
+      } catch {
+        setAreasList(DEFAULT_AREAS);
+      }
+      setLoadingAreas(false);
+    })();
+  }, []);
+
+  function saveAreasList(list) {
+    setAreasList(list);
+    scheduleSync("areas_config", JSON.stringify(list));
+  }
+
+  function addAreaToList() {
+    const name = newAreaName.trim();
+    if (!name || areasList.includes(name)) return;
+    saveAreasList([...areasList, name]);
+    setNewAreaName("");
+  }
+
+  function startEditArea(idx) {
+    setEditingAreaIdx(idx);
+    setEditingAreaValue(areasList[idx]);
+  }
+
+  function saveEditArea() {
+    const nuevoNombre = editingAreaValue.trim();
+    if (!nuevoNombre) return;
+    const nombreAnterior = areasList[editingAreaIdx];
+    const nuevaLista = areasList.map((a, i) => (i === editingAreaIdx ? nuevoNombre : a));
+    saveAreasList(nuevaLista);
+    // renombrar también en los empleados que ya tenían asignada esa área
+    if (nombreAnterior !== nuevoNombre) {
+      saveEmployeesList(
+        employees.map((e) =>
+          (e.areas || []).includes(nombreAnterior)
+            ? { ...e, areas: e.areas.map((a) => (a === nombreAnterior ? nuevoNombre : a)) }
+            : e
+        )
+      );
+    }
+    setEditingAreaIdx(null);
+    setEditingAreaValue("");
+  }
+
+  function deleteArea(idx) {
+    const nombre = areasList[idx];
+    saveAreasList(areasList.filter((_, i) => i !== idx));
+    // quitarla también de cualquier empleado que la tuviera asignada
+    saveEmployeesList(employees.map((e) => (e.areas || []).includes(nombre) ? { ...e, areas: e.areas.filter((a) => a !== nombre) } : e));
+    setConfirmDeleteAreaIdx(null);
+  }
+
+  const [horarioDiaSeleccionado, setHorarioDiaSeleccionado] = useState(new Date().getDay());
+
+  // ---------- mínimo de personal por área ----------
+  const [areaMinimos, setAreaMinimos] = useState({}); // { [nombreArea]: number }
+  const [loadingAreaMinimos, setLoadingAreaMinimos] = useState(true);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const r = await storageGet("area_minimos");
+        setAreaMinimos(r ? JSON.parse(r.value) : {});
+      } catch {
+        setAreaMinimos({});
+      }
+      setLoadingAreaMinimos(false);
+    })();
+  }, []);
+
+  function setAreaMinimo(areaName, value) {
+    const next = { ...areaMinimos, [areaName]: Math.max(0, Number(value) || 0) };
+    setAreaMinimos(next);
+    scheduleSync("area_minimos", JSON.stringify(next));
+  }
+
+  // ---------- turnos (matutino / medio / nocturno) ----------
+  const DEFAULT_TURNOS = [
+    { id: "matutino", nombre: "Matutino", start: "07:00", end: "15:00" },
+    { id: "medio", nombre: "Medio", start: "13:00", end: "19:00" },
+    { id: "nocturno", nombre: "Nocturno", start: "19:00", end: "01:00" },
+  ];
+  const [turnosConfig, setTurnosConfig] = useState({ habilitado: false, turnos: DEFAULT_TURNOS });
+  const [loadingTurnos, setLoadingTurnos] = useState(true);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const r = await storageGet("turnos_config");
+        setTurnosConfig(r ? JSON.parse(r.value) : { habilitado: false, turnos: DEFAULT_TURNOS });
+      } catch {
+        setTurnosConfig({ habilitado: false, turnos: DEFAULT_TURNOS });
+      }
+      setLoadingTurnos(false);
+    })();
+  }, []);
+
+  function saveTurnosConfig(next) {
+    setTurnosConfig(next);
+    scheduleSync("turnos_config", JSON.stringify(next));
+  }
+
+  function toggleTurnosHabilitado() {
+    saveTurnosConfig({ ...turnosConfig, habilitado: !turnosConfig.habilitado });
+  }
+
+  function updateTurnoDefinicion(turnoId, patch) {
+    saveTurnosConfig({
+      ...turnosConfig,
+      turnos: turnosConfig.turnos.map((t) => (t.id === turnoId ? { ...t, ...patch } : t)),
+    });
+  }
 
   const [selectedEmployeeId, setSelectedEmployeeId] = useState(null);
 
@@ -532,10 +1425,6 @@ export default function RelojChecador() {
   }, [recordsByDate]);
 
   const [punchModal, setPunchModal] = useState(null); // {type, photo}
-  const [areaModal, setAreaModal] = useState(null); // {employeeName} — se muestra tras confirmar una entrada
-  const [salidaForkModal, setSalidaForkModal] = useState(null); // {employeeId, employeeName} — se muestra tras confirmar una salida
-  const [produccionModal, setProduccionModal] = useState(null); // {employeeId, employeeName}
-  const [mercanciaModal, setMercanciaModal] = useState(null); // {employeeId, employeeName}
   const [toast, setToast] = useState(null);
   const fileInputRef = useRef(null);
 
@@ -595,13 +1484,179 @@ export default function RelojChecador() {
     .sort()
     .reverse();
 
+  // ---------- resumen mensual imprimible ----------
+  const [printView, setPrintView] = useState(null); // { month: "YYYY-MM" } | null
+  const [confirmPurgeMonth, setConfirmPurgeMonth] = useState(false);
+  const [showDriveHelp, setShowDriveHelp] = useState(false);
+
+  useEffect(() => {
+    setConfirmPurgeMonth(false);
+    setShowDriveHelp(false);
+  }, [printView]);
+
+  // ---------- datos del negocio (para encabezados de recibos) ----------
+  const [businessConfig, setBusinessConfig] = useState({ nombre: "Restaurante Bondiola", direccion: "", encabezado: "" });
+  const [businessConfigDraft, setBusinessConfigDraft] = useState({ nombre: "", direccion: "", encabezado: "" });
+  const [businessLogo, setBusinessLogo] = useState(null); // data URL, se queda local en este dispositivo
+  const [showBusinessConfigEdit, setShowBusinessConfigEdit] = useState(false);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const r = await storageGet("business_config");
+        const cfg = r ? JSON.parse(r.value) : { nombre: "Restaurante Bondiola", direccion: "", encabezado: "" };
+        setBusinessConfig(cfg);
+        setBusinessConfigDraft(cfg);
+      } catch {
+        // se queda con el valor por defecto
+      }
+      try {
+        const logo = await getPhotoLocal("business_logo");
+        if (logo) setBusinessLogo(logo);
+      } catch {
+        // sin logo guardado todavía
+      }
+    })();
+  }, []);
+
+  function saveBusinessConfig() {
+    setBusinessConfig(businessConfigDraft);
+    scheduleSync("business_config", JSON.stringify(businessConfigDraft));
+    setShowBusinessConfigEdit(false);
+    setToast({ color: sage, text: "Datos del negocio actualizados." });
+  }
+
+  async function handleLogoUpload(e) {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    try {
+      const dataUrl = await compressImage(file, 320, 0.85);
+      await savePhotoLocal("business_logo", dataUrl);
+      setBusinessLogo(dataUrl);
+      setToast({ color: sage, text: "Logo actualizado en este dispositivo." });
+    } catch {
+      setToast({ color: paprika, text: "No se pudo guardar el logo." });
+    }
+  }
+
+  async function removeLogo() {
+    try {
+      await deletePhotoLocal("business_logo");
+    } catch {
+      // no pasa nada si no existía
+    }
+    setBusinessLogo(null);
+  }
+
+  // ---------- nómina ----------
+  const [payrollSelectedEmployeeId, setPayrollSelectedEmployeeId] = useState(null);
+  const [payrollDraft, setPayrollDraft] = useState(null);
+  const [payrollPrintView, setPayrollPrintView] = useState(null); // { employee, worked, totals, draft } | null
+  const [payrollRuns, setPayrollRuns] = useState([]);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const r = await storageGet("payroll_runs");
+        setPayrollRuns(r ? JSON.parse(r.value) : []);
+      } catch {
+        setPayrollRuns([]);
+      }
+    })();
+  }, []);
+
+  // guarda el recibo generado en el histórico y deja el formulario listo para la siguiente jornada
+  function handleGeneratePayroll(worked, totals) {
+    const emp = employees.find((e) => e.id === payrollSelectedEmployeeId);
+    if (!emp || !payrollDraft) return;
+    const run = {
+      id: uid("nomina"),
+      employeeId: emp.id,
+      employeeName: emp.name,
+      periodStart: payrollDraft.periodStart,
+      periodEnd: payrollDraft.periodEnd,
+      draft: payrollDraft,
+      worked,
+      totals,
+      creadoEn: new Date().toISOString(),
+    };
+    const actualizado = [run, ...payrollRuns].slice(0, 200);
+    setPayrollRuns(actualizado);
+    scheduleSync("payroll_runs", JSON.stringify(actualizado));
+
+    setPayrollPrintView({ employee: emp, draft: payrollDraft, worked, totals });
+    openPayroll(emp.id); // reinicia el formulario a un borrador limpio para la siguiente jornada
+  }
+
   // ---------- propinas ----------
-  const [propinasFecha, setPropinasFecha] = useState(localDateKey());
+  const [propinasPeriodoInicio, setPropinasPeriodoInicio] = useState(localDateKey());
+  const [propinasPeriodoFin, setPropinasPeriodoFin] = useState(localDateKey());
   const [propinasMonto, setPropinasMonto] = useState("");
   const [propinasQuien, setPropinasQuien] = useState("");
-  const [externosCatalogo, setExternosCatalogo] = useState([]); // recurrentes, ej. [{id, nombre}]
-  const [externosPorDia, setExternosPorDia] = useState([]); // [{id, fecha, nombre, externoId}]
-  const [showAgregarExterno, setShowAgregarExterno] = useState(false);
+  const [propinasHistorial, setPropinasHistorial] = useState([]);
+  const [loadingPropinasHistorial, setLoadingPropinasHistorial] = useState(true);
+  const [showPropinasHistorial, setShowPropinasHistorial] = useState(false);
+
+  // configuración global de propinas: visible para cualquiera, pero solo se edita con PIN.
+  // toleranciaMin: minutos para calificar a propina · frecuencia: cada cuánto se cierra el
+  // reparto (diaria/semanal/mensual) · modoEntrega: si se paga aparte cada vez, o se junta
+  // y se entrega hasta la nómina del periodo.
+  const [propinasConfig, setPropinasConfig] = useState({ toleranciaMin: 15, frecuencia: "diaria", modoEntrega: "diaria" });
+  const [propinasConfigDraft, setPropinasConfigDraft] = useState({ toleranciaMin: "15", frecuencia: "diaria", modoEntrega: "diaria" });
+  const [showPropinasConfigEdit, setShowPropinasConfigEdit] = useState(false);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const r = await storageGet("propinas_config");
+        const cfg = r ? JSON.parse(r.value) : { toleranciaMin: 15, frecuencia: "diaria", modoEntrega: "diaria" };
+        setPropinasConfig(cfg);
+        setPropinasConfigDraft({ ...cfg, toleranciaMin: String(cfg.toleranciaMin) });
+      } catch {
+        // se queda con los valores por defecto
+      }
+    })();
+  }, []);
+
+  // al cambiar la frecuencia (incluida la que ya está guardada al cargar), recalcula el
+  // rango de fechas por defecto para el reparto
+  useEffect(() => {
+    const hoy = new Date();
+    if (propinasConfig.frecuencia === "semanal") {
+      const inicio = new Date(hoy);
+      inicio.setDate(hoy.getDate() - hoy.getDay());
+      const fin = new Date(inicio);
+      fin.setDate(inicio.getDate() + 6);
+      setPropinasPeriodoInicio(localDateKey(inicio));
+      setPropinasPeriodoFin(localDateKey(fin));
+    } else if (propinasConfig.frecuencia === "mensual") {
+      const inicio = new Date(hoy.getFullYear(), hoy.getMonth(), 1);
+      const fin = new Date(hoy.getFullYear(), hoy.getMonth() + 1, 0);
+      setPropinasPeriodoInicio(localDateKey(inicio));
+      setPropinasPeriodoFin(localDateKey(fin));
+    } else {
+      setPropinasPeriodoInicio(localDateKey(hoy));
+      setPropinasPeriodoFin(localDateKey(hoy));
+    }
+  }, [propinasConfig.frecuencia]);
+
+  function savePropinasConfig() {
+    const cfg = {
+      toleranciaMin: Number(propinasConfigDraft.toleranciaMin) || 0,
+      frecuencia: propinasConfigDraft.frecuencia,
+      modoEntrega: propinasConfigDraft.modoEntrega,
+    };
+    setPropinasConfig(cfg);
+    scheduleSync("propinas_config", JSON.stringify(cfg));
+    setShowPropinasConfigEdit(false);
+    setToast({ color: sage, text: "Configuración de propinas actualizada." });
+  }
+
+  // ---------- personal externo (temporal) ----------
+  const [externosCatalogo, setExternosCatalogo] = useState([]);
+  const [externosPorDia, setExternosPorDia] = useState([]);
+  const [propinasFecha, setPropinasFecha] = useState(localDateKey());
   const [nuevoExternoNombre, setNuevoExternoNombre] = useState("");
 
   const loadExternos = useCallback(async () => {
@@ -652,109 +1707,183 @@ export default function RelojChecador() {
     scheduleSync("externos_por_dia", JSON.stringify(actualizado));
   }
 
-  const [propinasHistorial, setPropinasHistorial] = useState([]);
-  const [loadingPropinas, setLoadingPropinas] = useState(true);
-
-  const loadPropinasHistorial = useCallback(async () => {
-    setLoadingPropinas(true);
-    try {
-      const r = await storageGet("propinas_historial");
-      setPropinasHistorial(r ? JSON.parse(r.value) : []);
-    } catch {
-      setPropinasHistorial([]);
-    }
-    setLoadingPropinas(false);
-  }, []);
+  // ---------- corrección manual de puntualidad (superusuario) ----------
+  // Corrige directo el registro de la entrada de un día específico, cuando un error ajeno
+  // a la persona (falla al checar, etc.) le impidió calificar. Al corregir la fuente, el
+  // cambio se ve automáticamente en Bitácora, Nómina y Propinas — no es un cálculo aparte.
+  const [showAjusteManual, setShowAjusteManual] = useState(false);
+  const [ajusteEmpleadoId, setAjusteEmpleadoId] = useState("");
+  const [ajusteFecha, setAjusteFecha] = useState(localDateKey());
+  const [ajusteBono, setAjusteBono] = useState(false);
+  const [ajustePropina, setAjustePropina] = useState(false);
+  const [ajusteMotivo, setAjusteMotivo] = useState("");
+  const [ajustesLog, setAjustesLog] = useState([]);
 
   useEffect(() => {
-    loadPropinasHistorial();
-  }, [loadPropinasHistorial]);
+    (async () => {
+      try {
+        const r = await storageGet("ajustes_manuales_log");
+        setAjustesLog(r ? JSON.parse(r.value) : []);
+      } catch {
+        setAjustesLog([]);
+      }
+    })();
+  }, []);
 
-  function calcularRepartoPropinas(fecha, monto) {
-    const dayRecords = recordsByDate[fecha] || [];
-    const entradasPorEmpleado = {};
-    dayRecords
-      .filter((r) => r.type === "entrada")
-      .forEach((r) => {
-        entradasPorEmpleado[r.employeeId] = r; // si hay más de una, se queda con la última
-      });
+  function aplicarCorreccionManual() {
+    if (!ajusteEmpleadoId || !ajusteFecha || !ajusteMotivo.trim()) return;
+    if (!ajusteBono && !ajustePropina) return;
 
-    const empleados = Object.values(entradasPorEmpleado).map((r) => {
-      const califica = r.punctuality === "bono" || r.punctuality === "propina";
-      return {
-        employeeId: r.employeeId,
-        employeeName: r.employeeName,
-        punctuality: r.punctuality,
-        minutesLate: r.minutesLate,
-        califica,
-        externo: false,
-        motivo: califica
-          ? null
-          : r.punctuality === "ninguno"
-          ? "Llegó fuera de tolerancia (+15 min)"
-          : "Sin horario configurado ese día",
-      };
-    });
+    const dayRecords = recordsByDate[ajusteFecha] || [];
+    const idx = dayRecords.findIndex((r) => r.employeeId === ajusteEmpleadoId && r.type === "entrada");
+    if (idx === -1) {
+      setToast({ color: paprika, text: "Esa persona no tiene una entrada registrada ese día." });
+      return;
+    }
 
-    const externosHoy = externosPorDia
-      .filter((e) => e.fecha === fecha)
-      .map((e) => ({
-        employeeId: e.id,
-        employeeName: e.nombre,
-        punctuality: null,
-        minutesLate: null,
-        califica: true,
-        externo: true,
-        motivo: null,
-      }));
-
-    const todos = [...empleados, ...externosHoy];
-
-    const calificanIds = todos.filter((t) => t.califica);
-    // matemática en centavos enteros: siempre redondea hacia abajo, sin sorpresas de decimales
-    const montoCentavos = Math.round((Number(monto) || 0) * 100);
-    const porPersonaCentavos = calificanIds.length > 0 ? Math.floor(montoCentavos / calificanIds.length) : 0;
-    const sobranteCentavos = calificanIds.length > 0 ? montoCentavos - porPersonaCentavos * calificanIds.length : montoCentavos;
-    const porPersona = porPersonaCentavos / 100;
-
-    return {
-      lista: todos
-        .map((t) => ({ ...t, monto: t.califica ? porPersona : 0 }))
-        .sort((a, b) => (b.califica === a.califica ? a.employeeName.localeCompare(b.employeeName) : b.califica ? 1 : -1)),
-      sobrante: sobranteCentavos / 100,
+    // "bono" ya incluye derecho a propina (mismo criterio que el resto de la app); si solo
+    // se marca propina, el nivel queda en "propina" nada más.
+    const nuevoTier = ajusteBono ? "bono" : "propina";
+    const updatedDay = [...dayRecords];
+    updatedDay[idx] = {
+      ...updatedDay[idx],
+      punctuality: nuevoTier,
+      correccionManual: { motivo: ajusteMotivo.trim(), aplicadoEn: new Date().toISOString() },
     };
+    const updatedAll = { ...recordsByDate, [ajusteFecha]: updatedDay };
+    setRecordsByDate(updatedAll);
+    scheduleSync("records", JSON.stringify(updatedAll));
+
+    const emp = employees.find((e) => e.id === ajusteEmpleadoId);
+    const logEntry = {
+      id: uid("ajuste"),
+      employeeId: ajusteEmpleadoId,
+      employeeName: emp?.name || ajusteEmpleadoId,
+      fecha: ajusteFecha,
+      bono: ajusteBono,
+      propina: ajustePropina || ajusteBono,
+      motivo: ajusteMotivo.trim(),
+      creadoEn: new Date().toISOString(),
+    };
+    const actualizado = [logEntry, ...ajustesLog].slice(0, 100);
+    setAjustesLog(actualizado);
+    scheduleSync("ajustes_manuales_log", JSON.stringify(actualizado));
+
+    setAjusteEmpleadoId("");
+    setAjusteMotivo("");
+    setAjusteBono(false);
+    setAjustePropina(false);
+    setToast({ color: sage, text: `Corrección aplicada a ${emp?.name || "empleado"} — ya se refleja en todos lados.` });
   }
 
-  async function guardarReparto(fecha, monto, reparto, quien) {
+  useEffect(() => {
+    (async () => {
+      try {
+        const r = await storageGet("propinas_historial");
+        setPropinasHistorial(r ? JSON.parse(r.value) : []);
+      } catch {
+        setPropinasHistorial([]);
+      }
+      setLoadingPropinasHistorial(false);
+    })();
+  }, []);
+
+  async function guardarReparto(fechaInicio, fechaFin, monto, reparto, quien) {
     const nuevo = {
       id: uid("propina"),
-      fecha,
+      fechaInicio,
+      fechaFin,
       monto: Number(monto) || 0,
       reparto,
       quien: quien || "",
       creadoEn: new Date().toISOString(),
     };
-    const sinEsaFecha = propinasHistorial.filter((p) => p.fecha !== fecha);
-    const actualizado = [nuevo, ...sinEsaFecha].slice(0, 60); // conserva los últimos 60 repartos
+    const sinEseRango = propinasHistorial.filter(
+      (p) => !((p.fechaInicio || p.fecha) === fechaInicio && (p.fechaFin || p.fecha) === fechaFin)
+    );
+    const actualizado = [nuevo, ...sinEseRango].slice(0, 60); // conserva los últimos 60 repartos
     setPropinasHistorial(actualizado);
     scheduleSync("propinas_historial", JSON.stringify(actualizado));
-    setToast({ color: sage, text: `Propinas de ${formatDateLabel(fecha, today)} guardadas.` });
+    setPropinasMonto("");
+    setPropinasQuien("");
+    const rangoLabel =
+      fechaInicio === fechaFin
+        ? formatDateLabel(fechaInicio, today)
+        : `${formatDateLabel(fechaInicio, today)} – ${formatDateLabel(fechaFin, today)}`;
+    setToast({ color: sage, text: `Propinas de ${rangoLabel} guardadas.` });
   }
 
-  // ---------- resumen mensual imprimible ----------
-  const [printView, setPrintView] = useState(null); // { month: "YYYY-MM" } | null
-  const [confirmPurgeMonth, setConfirmPurgeMonth] = useState(false);
-  const [showDriveHelp, setShowDriveHelp] = useState(false);
+  function openPayroll(employeeId) {
+    const emp = employees.find((e) => e.id === employeeId);
+    if (!emp) return;
+    const payroll = emp.payroll || defaultPayroll();
+    const period = defaultPeriodDates(payroll.payPeriod);
+    setPayrollSelectedEmployeeId(employeeId);
+    setPayrollDraft({
+      ...payroll,
+      periodStart: period.start,
+      periodEnd: period.end,
+      vacacionesFechas: [],
+      leyPercent: payroll.leyPercent || 0,
+      enableBono: false,
+      enablePropina: false,
+      enableVacaciones: false,
+      enableDescuentos: false,
+      enableConsumo: false,
+      enableLey: false,
+      descuentos: [],
+      consumo: [],
+    });
+  }
 
-  useEffect(() => {
-    setConfirmPurgeMonth(false);
-    setShowDriveHelp(false);
-  }, [printView]);
+  function closePayroll() {
+    setPayrollSelectedEmployeeId(null);
+    setPayrollDraft(null);
+  }
+
+  function updatePayrollDraft(patch) {
+    setPayrollDraft((d) => ({ ...d, ...patch }));
+  }
+
+  function addLineItem(field) {
+    setPayrollDraft((d) => ({ ...d, [field]: [...(d[field] || []), { label: "", amount: "" }] }));
+  }
+  function updateLineItem(field, idx, patch) {
+    setPayrollDraft((d) => {
+      const list = [...(d[field] || [])];
+      list[idx] = { ...list[idx], ...patch };
+      return { ...d, [field]: list };
+    });
+  }
+  function removeLineItem(field, idx) {
+    setPayrollDraft((d) => {
+      const list = [...(d[field] || [])];
+      list.splice(idx, 1);
+      return { ...d, [field]: list };
+    });
+  }
+
+  function savePayrollConfig() {
+    if (!payrollSelectedEmployeeId || !payrollDraft) return;
+    const configToSave = {
+      rateType: payrollDraft.rateType,
+      rateAmount: Number(payrollDraft.rateAmount) || 0,
+      payPeriod: payrollDraft.payPeriod,
+      bonoPorJornada: Number(payrollDraft.bonoPorJornada) || 0,
+      bonoFrecuencia: payrollDraft.bonoFrecuencia || "dia",
+      toleranciaBonoMin: Number(payrollDraft.toleranciaBonoMin) || 10,
+      leyPercent: Number(payrollDraft.leyPercent) || 0,
+    };
+    saveEmployeesList(
+      employees.map((e) => (e.id === payrollSelectedEmployeeId ? { ...e, payroll: configToSave } : e))
+    );
+    setToast({ color: sage, text: "Configuración de pago guardada — la tolerancia ya aplica en el Checador." });
+  }
 
   // Descarga el resumen ya formateado (documento HTML con tablas y líneas de firma),
   // listo para abrir en cualquier navegador e imprimir o guardar como PDF.
   function downloadMonthSummary(monthKeyStr) {
-    const html = buildMonthSummaryHtml(monthKeyStr, employees, recordsByDate);
+    const html = buildMonthSummaryHtml(monthKeyStr, employees, recordsByDate, businessConfig);
     const blob = new Blob([html], { type: "text/html" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -826,7 +1955,11 @@ export default function RelojChecador() {
 
   function requestUnlock(target) {
     if (unlockedSession) {
-      if (target !== "agregar") setTab(target);
+      if (target === "bitacora" || target === "nomina") setTab(target);
+      if (target === "propinas_historial") setShowPropinasHistorial(true);
+      if (target === "propinas_config_editar") setShowPropinasConfigEdit(true);
+      if (target === "propinas_ajuste_manual") setShowAjusteManual(true);
+      if (target === "business_config_editar") setShowBusinessConfigEdit(true);
       return;
     }
     if (!pin) {
@@ -842,7 +1975,11 @@ export default function RelojChecador() {
 
   function lockNow() {
     setUnlockedSession(false);
-    if (tab === "bitacora") setTab("checador");
+    setShowPropinasHistorial(false);
+    setShowPropinasConfigEdit(false);
+    setShowAjusteManual(false);
+    setShowBusinessConfigEdit(false);
+    if (tab === "bitacora" || tab === "nomina") setTab("checador");
   }
 
   function submitPin() {
@@ -857,7 +1994,11 @@ export default function RelojChecador() {
       setUnlockedSession(true);
       const target = pinModal.target;
       setPinModal(null);
-      if (target && target !== "agregar") setTab(target);
+      if (target === "bitacora" || target === "nomina") setTab(target);
+      if (target === "propinas_historial") setShowPropinasHistorial(true);
+      if (target === "propinas_config_editar") setShowPropinasConfigEdit(true);
+      if (target === "propinas_ajuste_manual") setShowAjusteManual(true);
+      if (target === "business_config_editar") setShowBusinessConfigEdit(true);
       return;
     }
 
@@ -875,7 +2016,11 @@ export default function RelojChecador() {
     setUnlockedSession(true);
     const target = pinModal.target;
     setPinModal(null);
-    if (target && target !== "agregar") setTab(target);
+    if (target === "bitacora" || target === "nomina") setTab(target);
+    if (target === "propinas_historial") setShowPropinasHistorial(true);
+    if (target === "propinas_config_editar") setShowPropinasConfigEdit(true);
+    if (target === "propinas_ajuste_manual") setShowAjusteManual(true);
+    if (target === "business_config_editar") setShowBusinessConfigEdit(true);
   }
 
   // ---------- load employees ----------
@@ -889,20 +2034,6 @@ export default function RelojChecador() {
       setEmployees([]);
     }
     setLoadingEmployees(false);
-  }, []);
-
-  const loadAsignaciones = useCallback(async () => {
-    try {
-      const r = await storageGet("asignaciones_area_hoy");
-      const todas = r ? JSON.parse(r.value) : [];
-      // conserva solo los últimos 14 días
-      const corte = new Date();
-      corte.setDate(corte.getDate() - 14);
-      const corteKey = localDateKey(corte);
-      setAsignaciones(todas.filter((a) => a.fecha >= corteKey));
-    } catch {
-      setAsignaciones([]);
-    }
   }, []);
 
   // ---------- load week (single 'records' key holding { date: record[] }) ----------
@@ -959,8 +2090,7 @@ export default function RelojChecador() {
   useEffect(() => {
     loadEmployees();
     loadRecords(true);
-    loadAsignaciones();
-  }, [loadEmployees, loadRecords, loadAsignaciones]);
+  }, [loadEmployees, loadRecords]);
 
   // poll for near real-time updates (status chips on Checador depend on this too)
   useEffect(() => {
@@ -990,6 +2120,7 @@ export default function RelojChecador() {
       name,
       puesto: newPuesto.trim() || "Sin puesto",
       active: true,
+      areas: [],
       schedule: initialSchedule, // espejo del horario vigente, por conveniencia
       scheduleHistory: [{ effectiveFrom: localDateKey(), schedule: initialSchedule }],
     };
@@ -1042,24 +2173,136 @@ export default function RelojChecador() {
     setScheduleModal(null);
   }
 
+  // edición rápida de un solo día desde la vista "Horario por día" — mismo versionado que
+  // el editor por empleado (aplica desde hoy, conserva el histórico de meses pasados)
+  function quickUpdateEmployeeDay(employeeId, dayIdx, patch) {
+    const todayKey = localDateKey();
+    saveEmployeesList(
+      employees.map((e) => {
+        if (e.id !== employeeId) return e;
+        const current = getScheduleForDate(e, todayKey) || defaultSchedule();
+        const updatedSchedule = { ...current, [dayIdx]: { ...current[dayIdx], ...patch } };
+        const history = e.scheduleHistory ? [...e.scheduleHistory] : [];
+        const idx = history.findIndex((v) => v.effectiveFrom === todayKey);
+        if (idx >= 0) history[idx] = { effectiveFrom: todayKey, schedule: updatedSchedule };
+        else history.push({ effectiveFrom: todayKey, schedule: updatedSchedule });
+        history.sort((a, b) => (a.effectiveFrom < b.effectiveFrom ? -1 : a.effectiveFrom > b.effectiveFrom ? 1 : 0));
+        return { ...e, scheduleHistory: history, schedule: updatedSchedule };
+      })
+    );
+  }
+
+  // ---------- editor de áreas por empleado ----------
+  const [areasModal, setAreasModal] = useState(null); // { employeeId, draft: string[] }
+
+  function openAreasModal(employeeId) {
+    const emp = employees.find((e) => e.id === employeeId);
+    if (!emp) return;
+    setAreasModal({ employeeId, draft: emp.areas || [] });
+  }
+
+  function toggleAreaInModal(area) {
+    setAreasModal((m) => ({
+      ...m,
+      draft: m.draft.includes(area) ? m.draft.filter((a) => a !== area) : [...m.draft, area],
+    }));
+  }
+
+  function saveAreas() {
+    if (!areasModal) return;
+    saveEmployeesList(
+      employees.map((e) => (e.id === areasModal.employeeId ? { ...e, areas: areasModal.draft } : e))
+    );
+    setAreasModal(null);
+  }
+
+  // ---------- método de checado por empleado (foto / clave / biométrico) ----------
+  const [metodoModal, setMetodoModal] = useState(null); // { employeeId, draft: {tipo, clave, bioCredentialId}, error, enrolling }
+
+  function openMetodoModal(employeeId) {
+    const emp = employees.find((e) => e.id === employeeId);
+    if (!emp) return;
+    setMetodoModal({
+      employeeId,
+      draft: {
+        tipo: emp.checadaMetodo || "foto",
+        clave: emp.checadaClave || "",
+        bioCredentialId: emp.biometricCredentialId || null,
+      },
+      error: "",
+      enrolling: false,
+    });
+  }
+
+  function saveMetodo() {
+    if (!metodoModal) return;
+    const { tipo, clave, bioCredentialId } = metodoModal.draft;
+    if (tipo === "clave" && (!clave || clave.length !== 4)) {
+      setMetodoModal((m) => ({ ...m, error: "La clave debe tener exactamente 4 dígitos." }));
+      return;
+    }
+    if (tipo === "biometrico" && !bioCredentialId) {
+      setMetodoModal((m) => ({ ...m, error: "Registra primero la huella/rostro en este dispositivo." }));
+      return;
+    }
+    saveEmployeesList(
+      employees.map((e) =>
+        e.id === metodoModal.employeeId
+          ? { ...e, checadaMetodo: tipo, checadaClave: tipo === "clave" ? clave : e.checadaClave, biometricCredentialId: bioCredentialId }
+          : e
+      )
+    );
+    setMetodoModal(null);
+  }
+
+  async function enrollBiometricForModal() {
+    if (!metodoModal) return;
+    const emp = employees.find((e) => e.id === metodoModal.employeeId);
+    if (!emp) return;
+    setMetodoModal((m) => ({ ...m, enrolling: true, error: "" }));
+    try {
+      const credentialId = await enrollBiometric(emp.id, emp.name, businessConfig.nombre);
+      setMetodoModal((m) => ({ ...m, draft: { ...m.draft, bioCredentialId: credentialId }, enrolling: false }));
+      setToast({ color: sage, text: `Huella/rostro registrado para ${emp.name} en este dispositivo.` });
+    } catch (err) {
+      console.error("Error registrando biometría:", err);
+      setMetodoModal((m) => ({
+        ...m,
+        enrolling: false,
+        error: "No se pudo registrar. Cancelado o no compatible con este dispositivo/navegador.",
+      }));
+    }
+  }
+
   // ---------- status (based on today only) ----------
 
   function statusFor(employeeId) {
     const own = (recordsByDate[today] || []).filter((r) => r.employeeId === employeeId);
     if (own.length === 0) return "fuera";
-    const last = own[own.length - 1];
-    if (last.type === "salida") return "fuera";
-    // último registro es entrada sin salida — revisamos si ya se cumplió la tolerancia
-    const emp = employees.find((e) => e.id === employeeId);
-    const daySchedule = emp ? getScheduleForDate(emp, today)?.[new Date().getDay()] : null;
-    if (daySchedule?.enabled && salidaAsumidaIso(today, daySchedule.end)) return "fuera";
-    return "dentro";
+    return own[own.length - 1].type === "entrada" ? "dentro" : "fuera";
   }
 
   // ---------- punching ----------
 
   function openPunch(type) {
-    setPunchModal({ type, photo: null });
+    const emp = employees.find((e) => e.id === selectedEmployeeId);
+    const areas = emp?.areas || [];
+    const area = type === "entrada" && areas.length === 1 ? areas[0] : null;
+    const metodo = emp?.checadaMetodo || "foto";
+    setPunchModal({ type, photo: null, area, metodo, claveInput: "", claveError: "", bioStatus: "idle" });
+  }
+
+  async function runBiometricCheck() {
+    const emp = employees.find((e) => e.id === selectedEmployeeId);
+    if (!emp?.biometricCredentialId) return;
+    setPunchModal((p) => (p ? { ...p, bioStatus: "checking" } : p));
+    try {
+      const ok = await verifyBiometric(emp.biometricCredentialId);
+      setPunchModal((p) => (p ? { ...p, bioStatus: ok ? "success" : "error" } : p));
+    } catch (err) {
+      console.error("Error verificando biometría:", err);
+      setPunchModal((p) => (p ? { ...p, bioStatus: "error" } : p));
+    }
   }
 
   function triggerCamera() {
@@ -1082,10 +2325,18 @@ export default function RelojChecador() {
 
   function confirmPunch() {
     if (!punchModal || !selectedEmployeeId) return;
-    if (punchModal.type === "entrada" && !punchModal.photo) return;
 
     const emp = employees.find((e) => e.id === selectedEmployeeId);
     if (!emp) return;
+
+    const metodo = punchModal.metodo || "foto";
+    if (punchModal.type === "entrada") {
+      if (metodo === "foto" && !punchModal.photo) return;
+      if (metodo === "clave" && punchModal.claveInput !== emp.checadaClave) return;
+      if (metodo === "biometrico" && punchModal.bioStatus !== "success") return;
+    }
+
+    if (punchModal.type === "entrada" && (emp.areas || []).length > 1 && !punchModal.area) return;
 
     const now = new Date();
     const nowIso = now.toISOString();
@@ -1096,7 +2347,8 @@ export default function RelojChecador() {
       const daySchedule = getScheduleForDate(emp, today)?.[now.getDay()];
       if (daySchedule?.enabled && daySchedule.start) {
         minsLate = minutesLate(daySchedule.start, nowIso);
-        punctuality = punctualityTier(minsLate);
+        const tolBono = emp.payroll?.toleranciaBonoMin ?? 10;
+        punctuality = punctualityTier(minsLate, tolBono, propinasConfig.toleranciaMin);
       }
     }
 
@@ -1106,7 +2358,9 @@ export default function RelojChecador() {
       employeeName: emp.name,
       type: punchModal.type,
       time: nowIso,
+      area: punchModal.type === "entrada" ? punchModal.area || null : null,
       hasPhoto: !!punchModal.photo,
+      checadaMetodo: punchModal.type === "entrada" ? metodo : null,
       punctuality, // 'bono' | 'propina' | 'ninguno' | null (sin horario configurado ese día)
       minutesLate: minsLate,
     };
@@ -1141,90 +2395,7 @@ export default function RelojChecador() {
     }
     setToast({ color: punctuality ? meta.color : sage, text: toastText });
     setPunchModal(null);
-    if (punchModal.type === "entrada") {
-      setAreaModal({ employeeId: emp.id, employeeName: emp.name });
-    } else {
-      setSalidaForkModal({ employeeId: emp.id, employeeName: emp.name });
-    }
-  }
-
-  function registrarAsignacionArea(area) {
-    if (!areaModal) return;
-    const hoyKeyLocal = today;
-    // reemplaza cualquier asignación previa de este mismo empleado hoy (si cambió de área)
-    const sinAnterior = asignaciones.filter((a) => !(a.employeeId === areaModal.employeeId && a.fecha === hoyKeyLocal));
-    const nueva = {
-      id: uid("asig"),
-      employeeId: areaModal.employeeId,
-      employeeName: areaModal.employeeName,
-      area,
-      fecha: hoyKeyLocal,
-      hora: new Date().toISOString(),
-    };
-    const actualizadas = [...sinAnterior, nueva];
-    setAsignaciones(actualizadas);
-    scheduleSync("asignaciones_area_hoy", JSON.stringify(actualizadas));
-
-    guardarAreaCompartida(area);
-    setToast({ color: sage, text: `Área de hoy: ${area}` });
-    setAreaModal(null);
-    setSelectedEmployeeId(null);
-  }
-
-  async function guardarProduccion(descripcion) {
-    if (!produccionModal) return;
-    const nuevo = {
-      id: uid("prod"),
-      employeeId: produccionModal.employeeId,
-      employeeName: produccionModal.employeeName,
-      fecha: today,
-      hora: new Date().toISOString(),
-      descripcion,
-    };
-    try {
-      const val = await kvGet("produccion_registros");
-      let lista = val || [];
-      lista = [nuevo, ...lista].slice(0, 300); // conserva los últimos 300 registros
-      await kvSet("produccion_registros", lista);
-      setToast({ color: sage, text: "Actividades de producción guardadas." });
-    } catch (e) {
-      setToast({ color: paprika, text: "No se pudo guardar. Intenta de nuevo." });
-    }
-    setProduccionModal(null);
-    setSalidaForkModal(null);
-    setSelectedEmployeeId(null);
-  }
-
-  async function guardarMercancia(itemsRecibidos, quien) {
-    // itemsRecibidos: [{ parItemId, nombre, unidad, cantidad }]
-    try {
-      const parItemsRaw = (await kvGet("par_items_v2", "kv_store")) || [];
-      const actualizados = parItemsRaw.map((pi) => {
-        const recibido = itemsRecibidos.find((r) => r.parItemId === pi.id);
-        if (!recibido) return pi;
-        return { ...pi, stockActual: Math.round((pi.stockActual + recibido.cantidad) * 10) / 10 };
-      });
-      await kvSet("par_items_v2", actualizados, "kv_store");
-
-      // registro liviano para trazabilidad (queda en el espacio de datos de PAR)
-      const registroVal = (await kvGet("entradas_mercancia_v1", "kv_store")) || [];
-      const nuevo = {
-        id: uid("merc"),
-        fecha: today,
-        hora: new Date().toISOString(),
-        quien,
-        items: itemsRecibidos.map((r) => ({ nombre: r.nombre, unidad: r.unidad, cantidad: r.cantidad })),
-      };
-      const registroActualizado = [nuevo, ...registroVal].slice(0, 200);
-      await kvSet("entradas_mercancia_v1", registroActualizado, "kv_store");
-
-      setToast({ color: sage, text: "Mercancía registrada — se sumó al inventario de PAR." });
-    } catch (e) {
-      setToast({ color: paprika, text: "No se pudo registrar la mercancía. Intenta de nuevo." });
-    }
-    setMercanciaModal(null);
-    setSalidaForkModal(null);
-    setSelectedEmployeeId(null);
+    setSelectedEmployeeId(null); // listo para el siguiente empleado
   }
 
   const activeEmployees = employees.filter((e) => e.active);
@@ -1242,11 +2413,383 @@ export default function RelojChecador() {
   const charcoal = "#201E1B";
   const brass = "#D6A24C";
   const steel = "#8A8F86";
-  // fondos pastel SÓLIDOS (no transparencias) para tarjetas con color de estado —
-  // así el texto oscuro siempre se lee bien, sin importar qué haya detrás.
-  const paprikaBg = "#F3DAD3";
-  const sageBg = "#DCE6DD";
-  const brassBg = "#F5E7C9";
+
+  // ---------- recibo de nómina imprimible ----------
+  if (payrollPrintView) {
+    const { employee: pEmp, draft: pDraft, worked: pWorked, totals: pTotals } = payrollPrintView;
+    const periodLabel = `${pDraft.periodStart} a ${pDraft.periodEnd}`;
+    const bizNombre = businessConfig.nombre || "Restaurante";
+    const bizInitials = bizNombre
+      .split(" ")
+      .filter(Boolean)
+      .map((w) => w[0])
+      .join("")
+      .slice(0, 3)
+      .toUpperCase();
+    const refCode = `REF. ${bizInitials}-${pDraft.periodStart.replace(/-/g, "")}`;
+    const mostrarBono = pDraft.enableBono && (pDraft.rateType !== "dia" || pTotals.bono > 0);
+    const mostrarVacaciones = pDraft.enableVacaciones && (pDraft.vacacionesFechas || []).length > 0;
+    const hasDeducciones =
+      pDraft.enableLey ||
+      (pDraft.enableDescuentos && (pDraft.descuentos || []).length > 0) ||
+      (pDraft.enableConsumo && (pDraft.consumo || []).length > 0);
+
+    return (
+      <div style={{ background: "#2a2a2a", minHeight: "100vh", fontFamily: "'Helvetica Neue', Arial, sans-serif" }}>
+        <style>{`
+          @page { size: letter; margin: 0.4in; }
+          @media print {
+            .no-print { display: none !important; }
+            .recibo-page { box-shadow: none !important; }
+          }
+          .recibo-page * { box-sizing: border-box; }
+          .recibo-section-title {
+            font-size: 0.64rem; font-weight: 900; text-transform: uppercase; letter-spacing: 0.06em;
+            color: #111; margin-top: 0.8rem; padding-bottom: 0.15rem; border-bottom: 1.5px solid #111;
+          }
+          .recibo-table { width: 100%; margin-top: 0.3rem; font-size: 0.72rem; border-collapse: collapse; }
+          .recibo-table th {
+            text-align: left; font-size: 0.56rem; text-transform: uppercase; letter-spacing: 0.03em;
+            color: #666; padding: 2px 6px; font-weight: 700; border-bottom: 1px solid #ccc;
+          }
+          .recibo-table td { padding: 3px 6px; border-bottom: 1px solid #eee; }
+          .recibo-table tbody tr:nth-child(odd) td { background: #00000005; }
+          .recibo-table .amt { text-align: right; font-family: 'Courier New', monospace; }
+          .recibo-table .total-row td { border-top: 1.5px solid #111; border-bottom: none; font-weight: 800; padding-top: 5px; background: transparent !important; }
+        `}</style>
+
+        <div
+          className="no-print flex items-center justify-between px-4 py-3"
+          style={{ borderBottom: `1px solid ${ink}22`, position: "sticky", top: 0, background: paper, maxWidth: 680, margin: "0 auto" }}
+        >
+          <button onClick={() => setPayrollPrintView(null)} className="text-sm font-bold" style={{ color: ink }}>
+            ← Volver
+          </button>
+          <div className="text-xs font-bold uppercase" style={{ color: ink + "88" }}>
+            Recibo de nómina
+          </div>
+          <button
+            onClick={() => window.print()}
+            className="px-3 py-1.5 rounded-sm font-bold text-xs uppercase"
+            style={{ background: brass, color: ink }}
+          >
+            Imprimir / Guardar PDF
+          </button>
+        </div>
+
+        <div
+          className="recibo-page"
+          style={{
+            maxWidth: 680,
+            minHeight: "10in",
+            margin: "0 auto",
+            background: "#fff",
+            color: "#111",
+            position: "relative",
+            padding: "1rem 1.4rem 1.2rem",
+            boxShadow: "0 4px 24px #00000055",
+          }}
+        >
+          <div style={{ height: 0, borderTop: "3px double #111" }} />
+          <div
+            style={{
+              position: "absolute",
+              top: "46%",
+              left: "50%",
+              transform: "translate(-50%,-50%) rotate(-22deg)",
+              fontSize: "1.7rem",
+              fontWeight: 900,
+              color: "#00000010",
+              whiteSpace: "nowrap",
+              pointerEvents: "none",
+            }}
+          >
+            RECIBO INTERNO — NO ES CFDI
+          </div>
+
+          <div style={{ border: "1px solid #111", borderRadius: 3, padding: "0.4rem 0.7rem", fontSize: "0.6rem", margin: "0.6rem 0 0.85rem", position: "relative" }}>
+            Documento interno de control, no es un CFDI de nómina válido ante el SAT.
+          </div>
+
+          <div style={{ display: "flex", alignItems: "center", gap: "0.6rem", position: "relative" }}>
+            {businessLogo ? (
+              <img src={businessLogo} alt="Logo" style={{ width: 34, height: 34, objectFit: "contain", borderRadius: "50%" }} />
+            ) : (
+              <div
+                style={{
+                  width: 34,
+                  height: 34,
+                  borderRadius: "50%",
+                  background: "#111",
+                  color: "#fff",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  fontWeight: 900,
+                  fontSize: "0.72rem",
+                  flexShrink: 0,
+                }}
+              >
+                {bizInitials || "RB"}
+              </div>
+            )}
+            <div>
+              <div style={{ fontSize: "0.9rem", fontWeight: 900, textTransform: "uppercase", letterSpacing: "-0.01em" }}>
+                {bizNombre}
+              </div>
+              {(businessConfig.direccion || businessConfig.encabezado) && (
+                <div style={{ fontSize: "0.6rem", color: "#444", lineHeight: 1.3 }}>
+                  {[businessConfig.direccion, businessConfig.encabezado].filter(Boolean).join(" · ")}
+                </div>
+              )}
+            </div>
+          </div>
+
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "flex-end",
+              marginTop: "0.7rem",
+              paddingBottom: "0.4rem",
+              borderBottom: "2px dashed #999",
+              position: "relative",
+            }}
+          >
+            <h1 style={{ fontSize: "1.05rem", fontWeight: 900, textTransform: "uppercase", letterSpacing: "-0.01em", margin: 0 }}>
+              Recibo de nómina
+            </h1>
+            <div style={{ fontFamily: "'Courier New', monospace", fontSize: "0.6rem", color: "#555", textAlign: "right", lineHeight: 1.5 }}>
+              <strong style={{ color: "#111", display: "block", fontSize: "0.64rem", letterSpacing: "0.02em" }}>{refCode}</strong>
+              Periodo {periodLabel}
+            </div>
+          </div>
+
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0 1.25rem", marginTop: "0.6rem", fontSize: "0.72rem", lineHeight: 1.4 }}>
+            <div>
+              <span style={{ fontSize: "0.56rem", textTransform: "uppercase", letterSpacing: "0.04em", color: "#666", display: "block" }}>
+                Empleado
+              </span>
+              <span style={{ fontWeight: 700 }}>{pEmp.name}</span>
+            </div>
+            <div>
+              <span style={{ fontSize: "0.56rem", textTransform: "uppercase", letterSpacing: "0.04em", color: "#666", display: "block" }}>
+                Puesto
+              </span>
+              <span style={{ fontWeight: 700 }}>{pEmp.puesto}</span>
+            </div>
+            <div style={{ marginTop: "0.3rem" }}>
+              <span style={{ fontSize: "0.56rem", textTransform: "uppercase", letterSpacing: "0.04em", color: "#666", display: "block" }}>
+                Tarifa
+              </span>
+              <span style={{ fontWeight: 700 }}>
+                {formatMoney(pDraft.rateAmount)} por {pDraft.rateType === "hora" ? "hora" : "jornada"}
+              </span>
+            </div>
+            <div style={{ marginTop: "0.3rem" }}>
+              <span style={{ fontSize: "0.56rem", textTransform: "uppercase", letterSpacing: "0.04em", color: "#666", display: "block" }}>
+                {pDraft.rateType === "hora" ? "Horas trabajadas" : "Días trabajados"}
+              </span>
+              <span style={{ fontWeight: 700 }}>{pDraft.rateType === "hora" ? pWorked.totalHoras : pWorked.totalDias}</span>
+            </div>
+          </div>
+
+          <div className="recibo-section-title">Percepciones</div>
+          <table className="recibo-table">
+            <thead>
+              <tr>
+                <th>Concepto</th>
+                <th className="amt">Monto</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Pago base</td>
+                <td className="amt">{formatMoney(pTotals.base)}</td>
+              </tr>
+              {mostrarBono && (
+                <tr>
+                  <td>Bono por puntualidad</td>
+                  <td className="amt">+{formatMoney(pTotals.bono)}</td>
+                </tr>
+              )}
+              {pDraft.enablePropina && (
+                <tr>
+                  <td>Reparto de propina</td>
+                  <td className="amt">+{formatMoney(pTotals.propina)}</td>
+                </tr>
+              )}
+              {mostrarVacaciones && (
+                <tr>
+                  <td>Vacaciones ({pDraft.vacacionesFechas.length} días)</td>
+                  <td className="amt">+{formatMoney(pTotals.vacaciones)}</td>
+                </tr>
+              )}
+              <tr className="total-row">
+                <td>Total percepciones</td>
+                <td className="amt">{formatMoney(pTotals.bruto)}</td>
+              </tr>
+            </tbody>
+          </table>
+
+          {hasDeducciones && (
+            <>
+              <div className="recibo-section-title">Deducciones</div>
+              <table className="recibo-table">
+                <thead>
+                  <tr>
+                    <th>Concepto</th>
+                    <th className="amt">Monto</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {pDraft.enableLey && (
+                    <tr>
+                      <td>Descuento de ley ({pDraft.leyPercent}%)</td>
+                      <td className="amt">({formatMoney(pTotals.leyDeduccion)})</td>
+                    </tr>
+                  )}
+                  {pDraft.enableDescuentos &&
+                    (pDraft.descuentos || []).map((d, i) => (
+                      <tr key={i}>
+                        <td>{d.label || "Descuento/penalización"}</td>
+                        <td className="amt">({formatMoney(d.amount)})</td>
+                      </tr>
+                    ))}
+                  {pDraft.enableConsumo &&
+                    (pDraft.consumo || []).map((c, i) => (
+                      <tr key={i}>
+                        <td>{c.label || "Consumo en el local"}</td>
+                        <td className="amt">({formatMoney(c.amount)})</td>
+                      </tr>
+                    ))}
+                  <tr className="total-row">
+                    <td>Total deducciones</td>
+                    <td className="amt">
+                      ({formatMoney(pTotals.leyDeduccion + pTotals.descuentos + pTotals.consumo)})
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </>
+          )}
+
+          <div
+            style={{
+              marginTop: "0.6rem",
+              border: "3px double #111",
+              borderRadius: 4,
+              padding: "0.5rem 0.9rem",
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "center",
+            }}
+          >
+            <span style={{ fontSize: "0.68rem", fontWeight: 900, textTransform: "uppercase", letterSpacing: "0.03em" }}>
+              Neto a pagar
+            </span>
+            <span style={{ fontSize: "1.15rem", fontWeight: 900, fontFamily: "'Courier New', monospace" }}>
+              {formatMoney(pTotals.neto)}
+            </span>
+          </div>
+          {pDraft.enableLey && (
+            <p style={{ fontSize: "0.56rem", color: "#555", marginTop: "0.3rem", lineHeight: 1.4 }}>
+              * El descuento de ley es un porcentaje simplificado, no un cálculo oficial de ISR/IMSS.
+            </p>
+          )}
+
+          {mostrarVacaciones && (
+            <div style={{ marginTop: "0.85rem", border: "1.5px dashed #111", borderRadius: 5, padding: "0.7rem 0.85rem", position: "relative" }}>
+              <p style={{ fontSize: "0.68rem", fontWeight: 900, textTransform: "uppercase", letterSpacing: "0.02em", margin: 0 }}>
+                Recibo individual de vacaciones
+              </p>
+              <p style={{ fontSize: "0.56rem", color: "#555", marginTop: "1px" }}>
+                Comprobante independiente de los días tomados a cuenta de vacaciones en este periodo.
+              </p>
+
+              <div style={{ marginTop: "0.4rem", fontSize: "0.66rem", lineHeight: 1.4 }}>
+                <strong>Trabajador:</strong> {pEmp.name} &nbsp;·&nbsp;
+                <strong>Puesto:</strong> {pEmp.puesto} &nbsp;·&nbsp;
+                <strong>Salario diario base:</strong> {formatMoney(pDraft.rateAmount)}
+              </div>
+
+              <table className="recibo-table">
+                <thead>
+                  <tr>
+                    <th>Día</th>
+                    <th>Fecha</th>
+                    <th className="amt">Monto</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {pDraft.vacacionesFechas.map((fecha) => (
+                    <tr key={fecha}>
+                      <td>{formatDateLabel(fecha, today)}</td>
+                      <td>{fecha}</td>
+                      <td className="amt">{formatMoney(pDraft.rateAmount)}</td>
+                    </tr>
+                  ))}
+                  <tr className="total-row">
+                    <td colSpan={2}>Total días de vacaciones ({pDraft.vacacionesFechas.length})</td>
+                    <td className="amt">{formatMoney(pTotals.vacaciones)}</td>
+                  </tr>
+                </tbody>
+              </table>
+
+              <p style={{ fontSize: "0.62rem", lineHeight: 1.45, color: "#111", marginTop: "0.5rem", borderLeft: "3px solid #111", paddingLeft: "0.55rem" }}>
+                Quien suscribe, <strong>{pEmp.name}</strong>, declara que solicitó y disfrutó de manera
+                <strong> voluntaria</strong> los días señalados arriba con cargo a su periodo vacacional, de
+                conformidad con el artículo 76 de la Ley Federal del Trabajo, y recibe a su entera
+                satisfacción el pago correspondiente a cada uno de esos días.
+              </p>
+              <p style={{ fontSize: "0.56rem", color: "#555", marginTop: "0.3rem" }}>
+                El monto ya está incluido en el neto a pagar de arriba — este apartado es el comprobante
+                individual.
+              </p>
+
+              <div style={{ marginTop: "0.75rem", display: "flex", justifyContent: "center" }}>
+                <div style={{ width: "62%", textAlign: "center" }}>
+                  <div style={{ borderTop: "1.5px solid #111", paddingTop: "4px", fontSize: "0.66rem", fontWeight: 600 }}>
+                    Firma del trabajador — recibí y acepto los días señalados
+                  </div>
+                  <div style={{ fontSize: "0.56rem", color: "#666", marginTop: "2px", textTransform: "uppercase", letterSpacing: "0.02em" }}>
+                    Nombre y fecha
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          <p style={{ marginTop: "0.8rem", fontSize: "0.66rem", lineHeight: 1.4, color: "#111", paddingTop: "0.45rem", borderTop: "2px dashed #999" }}>
+            Recibí de conformidad el monto neto indicado arriba, correspondiente al periodo señalado.
+          </p>
+
+          <div style={{ marginTop: "1.1rem", display: "flex", justifyContent: "space-between", gap: "2rem" }}>
+            <div style={{ flex: 1, textAlign: "center" }}>
+              <div style={{ borderTop: "1.5px solid #111", paddingTop: "4px", fontSize: "0.66rem", fontWeight: 600 }}>
+                Entregado por
+              </div>
+              <div style={{ fontSize: "0.56rem", color: "#666", marginTop: "2px", textTransform: "uppercase", letterSpacing: "0.02em" }}>
+                Nombre y fecha
+              </div>
+            </div>
+            <div style={{ flex: 1, textAlign: "center" }}>
+              <div style={{ borderTop: "1.5px solid #111", paddingTop: "4px", fontSize: "0.66rem", fontWeight: 600 }}>
+                Firma del empleado
+              </div>
+              <div style={{ fontSize: "0.56rem", color: "#666", marginTop: "2px", textTransform: "uppercase", letterSpacing: "0.02em" }}>
+                Nombre y fecha
+              </div>
+            </div>
+          </div>
+
+          <div style={{ textAlign: "center", marginTop: "0.9rem", fontSize: "0.52rem", color: "#777", textTransform: "uppercase", letterSpacing: "0.05em" }}>
+            Generado por Reloj Checador · {bizNombre}
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   // ---------- vista imprimible del resumen mensual (reemplaza toda la UI mientras esté activa) ----------
   if (printView) {
@@ -1370,7 +2913,7 @@ export default function RelojChecador() {
                 Resumen mensual de asistencia
               </h1>
               <p style={{ fontSize: "0.82rem", color: ink + "99", marginTop: "2px" }}>
-                Restaurante Bondiola · {monthLabel(printView.month)}
+                {businessConfig.nombre || "Restaurante"} · {monthLabel(printView.month)}
               </p>
 
               <div style={{ marginTop: "1rem", fontSize: "0.85rem", lineHeight: 1.6 }}>
@@ -1541,20 +3084,21 @@ export default function RelojChecador() {
           </span>
         </div>
 
-        <div className="flex gap-2 mt-4">
+        <div className="flex gap-2 mt-4 flex-wrap">
           {[
             { id: "checador", label: "Checador", icon: Clock },
             { id: "bitacora", label: "Bitácora", icon: unlockedSession ? ScrollText : Lock },
             { id: "propinas", label: "Propinas", icon: Coins },
             { id: "personal", label: "Personal", icon: Users },
+            { id: "nomina", label: "Nómina", icon: unlockedSession ? Wallet : Lock },
           ].map((t) => {
             const Icon = t.icon;
             const active = tab === t.id;
-            const protegida = t.id === "bitacora";
+            const protectedTabs = ["bitacora", "nomina"];
             return (
               <button
                 key={t.id}
-                onClick={() => (protegida ? requestUnlock(t.id) : setTab(t.id))}
+                onClick={() => (protectedTabs.includes(t.id) ? requestUnlock(t.id) : setTab(t.id))}
                 className="flex items-center gap-1.5 px-4 py-2 rounded-sm text-xs font-bold uppercase transition-colors"
                 style={{
                   background: active ? brass : "transparent",
@@ -1585,7 +3129,6 @@ export default function RelojChecador() {
             </div>
           ) : (
             <>
-              <AreasDeHoyPanel asignaciones={asignaciones} today={today} paper={paper} ink={ink} steel={steel} brass={brass} />
               <div>
                 <div
                   className="text-[10px] font-bold uppercase mb-2"
@@ -1593,34 +3136,52 @@ export default function RelojChecador() {
                 >
                   Selecciona tu nombre
                 </div>
-                <div
-                  className="grid gap-2"
-                  style={{ gridTemplateColumns: "repeat(auto-fill, minmax(9rem, 1fr))" }}
-                >
-                  {activeEmployees.map((emp) => {
-                    const st = statusFor(emp.id);
-                    const sel = emp.id === selectedEmployeeId;
-                    const dentro = st === "dentro";
-                    return (
-                      <button
-                        key={emp.id}
-                        onClick={() => setSelectedEmployeeId(emp.id)}
-                        className="w-full flex flex-col items-start gap-1 px-3 py-2 rounded-sm"
-                        style={{
-                          background: sel ? paper : dentro ? sage : "transparent",
-                          border: `1px solid ${sel ? paper : dentro ? sage : steel + "55"}`,
-                        }}
-                      >
-                        <span className="text-xs font-bold" style={{ color: sel ? ink : dentro ? "#fff" : paper }}>
-                          {emp.name}
-                        </span>
-                        <span className="text-[10px]" style={{ color: sel ? ink + "99" : dentro ? "#ffffffcc" : steel }}>
-                          {emp.puesto} · {dentro ? "Dentro" : "Fuera"}
-                        </span>
-                      </button>
-                    );
-                  })}
-                </div>
+                {(() => {
+                  const grupos = areasList.map((area) => ({
+                    area,
+                    emps: activeEmployees.filter((e) => (e.areas || []).includes(area)),
+                  })).filter((g) => g.emps.length > 0);
+                  const sinArea = activeEmployees.filter((e) => !e.areas || e.areas.length === 0);
+                  if (sinArea.length > 0) grupos.push({ area: "Sin área asignada", emps: sinArea });
+
+                  return grupos.map(({ area, emps }) => (
+                    <div key={area} className="mb-3 last:mb-0">
+                      <div className="text-[10px] font-bold mb-1.5" style={{ color: brass }}>
+                        {area}
+                      </div>
+                      <div className="grid gap-2" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(9rem, 1fr))" }}>
+                        {emps.map((emp) => {
+                          const st = statusFor(emp.id);
+                          const sel = emp.id === selectedEmployeeId;
+                          return (
+                            <button
+                              key={emp.id}
+                              onClick={() => setSelectedEmployeeId(emp.id)}
+                              className="w-full flex flex-col items-start gap-1 px-3 py-2 rounded-sm"
+                              style={{
+                                background: sel ? paper : "transparent",
+                                border: `1px solid ${sel ? paper : steel + "55"}`,
+                              }}
+                            >
+                              <div className="flex items-center gap-1.5">
+                                <span
+                                  className="inline-block rounded-full"
+                                  style={{ width: 7, height: 7, background: st === "dentro" ? sage : steel }}
+                                />
+                                <span className="text-xs font-bold" style={{ color: sel ? ink : paper }}>
+                                  {emp.name}
+                                </span>
+                              </div>
+                              <span className="text-[10px]" style={{ color: sel ? ink + "99" : steel }}>
+                                {emp.puesto} · {st === "dentro" ? "Dentro" : "Fuera"}
+                              </span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  ));
+                })()}
               </div>
 
               {selectedEmployee && (
@@ -1729,20 +3290,23 @@ export default function RelojChecador() {
             </button>
           </div>
 
-          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 mb-3 text-[9px]" style={{ color: steel }}>
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 mb-1 text-[9px]" style={{ color: steel }}>
             <span className="flex items-center gap-1">
               <span className="inline-block rounded-full" style={{ width: 6, height: 6, background: sage }} />
-              ≤10 min: bono + propina
+              Dentro de tolerancia de bono: bono + propina
             </span>
             <span className="flex items-center gap-1">
               <span className="inline-block rounded-full" style={{ width: 6, height: 6, background: brass }} />
-              11–15 min: solo propina
+              Dentro de tolerancia de propina: solo propina
             </span>
             <span className="flex items-center gap-1">
               <span className="inline-block rounded-full" style={{ width: 6, height: 6, background: paprika }} />
-              +15 min: sin bono ni propina
+              Fuera de tolerancia: sin bono ni propina
             </span>
           </div>
+          <p className="text-[9px] mb-3" style={{ color: steel + "aa" }}>
+            La tolerancia de cada quien se ajusta por empleado en Nómina → Bono.
+          </p>
 
           {loadingWeek ? (
             <div className="flex items-center gap-2 text-sm" style={{ color: steel }}>
@@ -1778,16 +3342,14 @@ export default function RelojChecador() {
                         const photoUrl = r.hasPhoto ? photoCache[r.id] : null;
                         const meta =
                           r.type === "entrada" ? punctualityMeta(r.punctuality, paprika, brass, sage) : null;
-                        const colorFondo = r.type === "entrada" && meta?.color ? meta.color : null;
-                        const fondoPastel =
-                          colorFondo === paprika ? paprikaBg : colorFondo === brass ? brassBg : colorFondo === sage ? sageBg : paper;
                         return (
                           <div
                             key={r.id}
-                            className="flex items-center gap-3 px-3 py-2.5 rounded-sm"
+                            className="flex items-center gap-3 px-3 py-2 rounded-sm"
                             style={{
-                              background: fondoPastel,
-                              border: colorFondo ? `1.5px solid ${colorFondo}` : `1px solid ${ink}11`,
+                              background: paper,
+                              borderTop: `2px dashed ${ink}22`,
+                              borderLeft: meta?.color ? `4px solid ${meta.color}` : "4px solid transparent",
                             }}
                           >
                             {photoUrl ? (
@@ -1796,17 +3358,17 @@ export default function RelojChecador() {
                                 alt={r.employeeName}
                                 className="rounded-full object-cover flex-shrink-0"
                                 style={{
-                                  width: 36,
-                                  height: 36,
-                                  border: `2px solid ${colorFondo || (r.type === "entrada" ? paprika : sage)}`,
+                                  width: 34,
+                                  height: 34,
+                                  border: `2px solid ${r.type === "entrada" ? paprika : sage}`,
                                 }}
                               />
                             ) : (
                               <div
                                 className="rounded-full flex items-center justify-center flex-shrink-0"
-                                style={{ width: 36, height: 36, background: (colorFondo || ink) + "22" }}
+                                style={{ width: 34, height: 34, background: ink + "11" }}
                               >
-                                <UserRound size={17} color={colorFondo || ink} />
+                                <UserRound size={16} color={ink} />
                               </div>
                             )}
                             <div className="flex-1 min-w-0">
@@ -1815,20 +3377,20 @@ export default function RelojChecador() {
                               </div>
                               <div
                                 className="text-[10px] font-mono uppercase"
-                                style={{ color: r.type === "entrada" ? (colorFondo || paprika) : sage }}
+                                style={{ color: r.type === "entrada" ? paprika : sage }}
                               >
                                 {r.type} · {formatTime(r.time)}
+                                {r.area ? ` · ${r.area}` : ""}
                               </div>
                             </div>
                             {meta?.color && (
-                              <div
-                                className="flex-shrink-0 flex items-center gap-1 text-xs font-black px-2 py-1.5 rounded-sm"
-                                style={{ background: meta.color, color: "#fff" }}
+                              <span
+                                className="flex-shrink-0 text-[9px] font-bold uppercase px-1.5 py-1 rounded-sm text-right"
+                                style={{ background: meta.color + "22", color: meta.color }}
                                 title={meta.label}
                               >
-                                {r.punctuality === "ninguno" ? <X size={13} /> : <Check size={13} />}
                                 {r.minutesLate <= 0 ? "A tiempo" : `+${r.minutesLate} min`}
-                              </div>
+                              </span>
                             )}
                           </div>
                         );
@@ -1842,322 +3404,16 @@ export default function RelojChecador() {
         </div>
       )}
 
-      {/* ---------------- PROPINAS TAB ---------------- */}
-      {tab === "propinas" && (
-        <div className="flex-1 px-5 py-5 flex flex-col gap-4 overflow-y-auto">
-          <div className="text-sm font-black uppercase" style={{ color: paper }}>
-            Propinas
-          </div>
-
-          <div className="rounded-sm p-4" style={{ background: paper }}>
-            <label className="text-[10px] font-bold uppercase mb-1 block" style={{ color: ink + "88" }}>
-              Fecha
-            </label>
-            <input
-              type="date"
-              value={propinasFecha}
-              onChange={(e) => { setPropinasFecha(e.target.value); setPropinasQuien(""); }}
-              className="w-full mb-3 px-3 py-2.5 rounded-sm text-sm outline-none"
-              style={{ border: `1px solid ${ink}33`, background: "#fff", color: ink }}
-            />
-
-            <label className="text-[10px] font-bold uppercase mb-1 block" style={{ color: ink + "88" }}>
-              ¿Quién hace esta operación?
-            </label>
-            {(() => {
-              const dayRecords = recordsByDate[propinasFecha] || [];
-              const idsVistos = new Set();
-              const quienesHoy = [];
-              dayRecords
-                .filter((r) => r.type === "entrada")
-                .forEach((r) => {
-                  if (!idsVistos.has(r.employeeId)) {
-                    idsVistos.add(r.employeeId);
-                    quienesHoy.push({ id: r.employeeId, nombre: r.employeeName });
-                  }
-                });
-
-              if (quienesHoy.length === 0) {
-                return (
-                  <p className="text-xs mb-3" style={{ color: ink + "66" }}>
-                    Nadie ha checado entrada esa fecha todavía.
-                  </p>
-                );
-              }
-
-              return (
-                <div className="flex flex-wrap gap-1.5 mb-3">
-                  {quienesHoy.map((p) => (
-                    <button
-                      key={p.id}
-                      onClick={() => setPropinasQuien(p.nombre)}
-                      className="px-3 py-2 rounded-sm text-xs font-bold"
-                      style={{
-                        background: propinasQuien === p.nombre ? brass : "#fff",
-                        color: ink,
-                        border: `1px solid ${propinasQuien === p.nombre ? brass : ink + "33"}`,
-                      }}
-                    >
-                      {p.nombre}
-                    </button>
-                  ))}
-                  <button
-                    onClick={() => {
-                      if (unlockedSession) {
-                        setPropinasQuien("Gerente");
-                      } else {
-                        requestUnlock("propinas");
-                      }
-                    }}
-                    className="px-3 py-2 rounded-sm text-xs font-bold flex items-center gap-1"
-                    style={{
-                      background: propinasQuien === "Gerente" ? sage : "#fff",
-                      color: propinasQuien === "Gerente" ? "#fff" : ink,
-                      border: `1px solid ${propinasQuien === "Gerente" ? sage : ink + "33"}`,
-                    }}
-                  >
-                    {!unlockedSession && <Lock size={11} />} Gerente
-                  </button>
-                </div>
-              );
-            })()}
-
-            <label className="text-[10px] font-bold uppercase mb-1 block" style={{ color: ink + "88" }}>
-              Monto total de propinas
-            </label>
-            <input
-              type="number"
-              inputMode="decimal"
-              value={propinasMonto}
-              onChange={(e) => setPropinasMonto(e.target.value)}
-              placeholder="$0.00"
-              className="w-full px-3 py-2.5 rounded-sm text-lg font-bold outline-none"
-              style={{ border: `1px solid ${ink}33`, background: "#fff", color: ink }}
-            />
-            <p className="text-[10px] mt-2" style={{ color: ink + "77" }}>
-              Se reparte en partes iguales solo entre quienes llegaron dentro de la tolerancia (≤15 min tarde) ese día.
-            </p>
-          </div>
-
-          {(() => {
-            const { lista: reparto, sobrante } = calcularRepartoPropinas(propinasFecha, propinasMonto);
-            const calificaron = reparto.filter((r) => r.califica).length;
-            return (
-              <>
-                {reparto.length === 0 ? (
-                  <div className="text-sm py-4 text-center" style={{ color: steel }}>
-                    Nadie registró entrada ese día.
-                  </div>
-                ) : (
-                  <div className="rounded-sm overflow-hidden" style={{ background: paper }}>
-                    {reparto.map((r, idx) => (
-                      <div
-                        key={r.employeeId}
-                        className="flex items-center justify-between px-3 py-2.5"
-                        style={{ borderTop: idx > 0 ? `1px solid ${ink}15` : "none" }}
-                      >
-                        <div className="min-w-0">
-                          <div className="flex items-center gap-1.5">
-                            <div className="text-sm font-bold truncate" style={{ color: ink }}>
-                              {r.employeeName}
-                            </div>
-                            {r.externo && (
-                              <span className="text-[9px] font-bold uppercase px-1.5 py-0.5 rounded-sm flex-shrink-0" style={{ background: sage + "22", color: sage }}>
-                                Externo
-                              </span>
-                            )}
-                          </div>
-                          <div className="text-[10px]" style={{ color: r.califica ? sage : ink + "66" }}>
-                            {r.externo
-                              ? "Agregado por el Gerente"
-                              : r.califica
-                              ? r.minutesLate <= 0
-                                ? "Llegó a tiempo"
-                                : `${r.minutesLate} min tarde`
-                              : r.motivo}
-                          </div>
-                        </div>
-                        <div
-                          className="text-sm font-black flex-shrink-0"
-                          style={{ color: r.califica ? sage : ink + "44" }}
-                        >
-                          {r.califica ? `$${r.monto.toFixed(2)}` : "—"}
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                )}
-
-                {reparto.length > 0 && sobrante > 0 && (
-                  <p className="text-[10px]" style={{ color: ink + "77" }}>
-                    Sobrante sin repartir (redondeo hacia abajo): ${sobrante.toFixed(2)}
-                  </p>
-                )}
-
-                {reparto.length > 0 && (
-                  <button
-                    onClick={() => guardarReparto(propinasFecha, propinasMonto, reparto, propinasQuien)}
-                    disabled={!propinasMonto || Number(propinasMonto) <= 0 || !propinasQuien.trim()}
-                    className="w-full flex items-center justify-center gap-2 py-3 rounded-sm font-bold text-sm uppercase disabled:opacity-40"
-                    style={{ background: brass, color: ink }}
-                  >
-                    <Coins size={16} /> Guardar reparto ({calificaron} {calificaron === 1 ? "persona" : "personas"})
-                  </button>
-                )}
-                {reparto.length > 0 && !propinasQuien.trim() && (
-                  <p className="text-[10px] text-center" style={{ color: paprika }}>
-                    Elige quién hace esta operación arriba para poder guardar.
-                  </p>
-                )}
-
-                <div className="pt-2" style={{ borderTop: `2px dashed ${steel}33` }}>
-                  <div className="flex items-center justify-between mt-3 mb-2">
-                    <div className="text-[10px] font-bold uppercase" style={{ color: steel, letterSpacing: "0.08em" }}>
-                      Personal externo de hoy
-                    </div>
-                    {!unlockedSession && (
-                      <span className="flex items-center gap-1 text-[10px] font-bold" style={{ color: steel }}>
-                        <Lock size={10} /> Solo Gerente
-                      </span>
-                    )}
-                  </div>
-
-                  {!unlockedSession ? (
-                    <button
-                      onClick={() => requestUnlock("propinas")}
-                      className="w-full rounded-sm p-3 flex items-center gap-2 text-left"
-                      style={{ background: paper }}
-                    >
-                      <Lock size={14} color={ink} />
-                      <span className="text-xs font-bold" style={{ color: ink }}>
-                        Ingresa la clave para agregar personal externo
-                      </span>
-                    </button>
-                  ) : (
-                    <>
-                      {externosPorDia.filter((e) => e.fecha === propinasFecha).length > 0 && (
-                        <div className="flex flex-col gap-1.5 mb-2">
-                          {externosPorDia.filter((e) => e.fecha === propinasFecha).map((e) => (
-                            <div key={e.id} className="flex items-center justify-between px-3 py-2 rounded-sm" style={{ background: sage + "18" }}>
-                              <span className="text-xs font-bold" style={{ color: ink }}>{e.nombre}</span>
-                              <button onClick={() => quitarExternoDelDia(e.id)}>
-                                <X size={14} color={paprika} />
-                              </button>
-                            </div>
-                          ))}
-                        </div>
-                      )}
-
-                      {externosCatalogo.filter((ext) => !externosPorDia.some((e) => e.fecha === propinasFecha && e.externoId === ext.id)).length > 0 && (
-                        <div className="mb-2">
-                          <div className="text-[10px] mb-1" style={{ color: ink + "88" }}>Recurrentes — toca para agregar:</div>
-                          <div className="flex flex-wrap gap-1.5">
-                            {externosCatalogo
-                              .filter((ext) => !externosPorDia.some((e) => e.fecha === propinasFecha && e.externoId === ext.id))
-                              .map((ext) => (
-                                <button
-                                  key={ext.id}
-                                  onClick={() => agregarExternoAlDia(ext)}
-                                  className="px-3 py-1.5 rounded-sm text-xs font-bold"
-                                  style={{ border: `1px solid ${ink}33`, color: ink }}
-                                >
-                                  + {ext.nombre}
-                                </button>
-                              ))}
-                          </div>
-                        </div>
-                      )}
-
-                      <div className="flex gap-2">
-                        <input
-                          value={nuevoExternoNombre}
-                          onChange={(e) => setNuevoExternoNombre(e.target.value)}
-                          onKeyDown={(e) => e.key === "Enter" && crearYAgregarExterno()}
-                          placeholder="Nombre de la persona externa"
-                          className="flex-1 px-3 py-2 rounded-sm text-sm outline-none"
-                          style={{ border: `1px solid ${ink}33`, background: "#fff", color: ink }}
-                        />
-                        <button
-                          onClick={crearYAgregarExterno}
-                          disabled={!nuevoExternoNombre.trim()}
-                          className="px-3 rounded-sm font-bold text-sm disabled:opacity-40"
-                          style={{ background: brass, color: ink }}
-                        >
-                          <Plus size={16} />
-                        </button>
-                      </div>
-                    </>
-                  )}
-                </div>
-              </>
-            );
-          })()}
-
-          <div className="pt-2" style={{ borderTop: `2px dashed ${steel}33` }}>
-            <div className="flex items-center justify-between mb-2 mt-3">
-              <div className="text-[10px] font-bold uppercase" style={{ color: steel, letterSpacing: "0.08em" }}>
-                Bitácora de propinas
-              </div>
-              {unlockedSession && (
-                <button onClick={lockNow} className="flex items-center gap-1 text-[10px] font-bold uppercase" style={{ color: steel }}>
-                  <Lock size={11} /> Bloquear
-                </button>
-              )}
-            </div>
-
-            {!unlockedSession ? (
-              <button
-                onClick={() => requestUnlock("propinas")}
-                className="w-full rounded-sm p-4 flex items-center gap-3 text-left"
-                style={{ background: paper }}
-              >
-                <div className="rounded-full flex items-center justify-center flex-shrink-0" style={{ width: 34, height: 34, background: brass + "33" }}>
-                  <Lock size={16} color={ink} />
-                </div>
-                <div>
-                  <div className="text-sm font-bold" style={{ color: ink }}>
-                    Solo el Gerente puede ver la bitácora
-                  </div>
-                  <div className="text-[11px]" style={{ color: ink + "88" }}>
-                    Toca para ingresar la clave
-                  </div>
-                </div>
-              </button>
-            ) : loadingPropinas ? (
-              <div className="flex items-center gap-2 text-sm" style={{ color: steel }}>
-                <Loader2 size={16} className="animate-spin" /> Cargando…
-              </div>
-            ) : propinasHistorial.length === 0 ? (
-              <div className="text-sm py-2" style={{ color: steel }}>
-                Sin repartos guardados todavía.
-              </div>
-            ) : (
-              <div className="flex flex-col gap-2">
-                {propinasHistorial.slice(0, 10).map((p) => (
-                  <div key={p.id} className="rounded-sm px-3 py-2.5" style={{ background: paper }}>
-                    <div className="flex items-center justify-between">
-                      <span className="text-xs font-bold" style={{ color: ink }}>
-                        {formatDateLabel(p.fecha, today)}
-                      </span>
-                      <span className="text-xs font-black" style={{ color: ink }}>
-                        ${p.monto.toFixed(2)}
-                      </span>
-                    </div>
-                    <div className="text-[10px] mt-0.5" style={{ color: ink + "77" }}>
-                      {p.reparto.filter((r) => r.califica).length} de {p.reparto.length} calificaron
-                      {p.quien ? ` · registrado por ${p.quien}` : ""}
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        </div>
-      )}
-
       {/* ---------------- PERSONAL TAB ---------------- */}
       {tab === "personal" && (
-        <div className="flex-1 px-5 py-5 flex flex-col gap-5">
+        <div className="flex-1 px-5 py-5 flex flex-col gap-6 overflow-y-auto min-h-0">
+          <div>
+            <div
+              className="text-[10px] font-bold uppercase mb-3 flex items-center gap-1.5"
+              style={{ color: brass, letterSpacing: "0.1em" }}
+            >
+              <Users size={12} /> Personal
+            </div>
           {unlockedSession ? (
             <div className="rounded-sm p-4" style={{ background: paper }}>
               <div className="flex items-center justify-between mb-3">
@@ -2253,8 +3509,39 @@ export default function RelojChecador() {
                     <div className="text-[10px] mt-0.5" style={{ color: ink + "66" }}>
                       {scheduleSummary(getScheduleForDate(emp, today))}
                     </div>
+                    <div className="text-[10px] mt-0.5" style={{ color: ink + "66" }}>
+                      {emp.areas && emp.areas.length > 0 ? emp.areas.join(" · ") : "Sin área asignada"}
+                    </div>
+                    <div className="text-[10px] mt-0.5" style={{ color: ink + "66" }}>
+                      Checado:{" "}
+                      {emp.checadaMetodo === "clave"
+                        ? "Clave de 4 dígitos"
+                        : emp.checadaMetodo === "biometrico"
+                        ? "Biométrico (huella/rostro)"
+                        : "Foto"}
+                    </div>
                   </div>
                   <div className="flex items-center gap-2 flex-shrink-0">
+                    {unlockedSession && (
+                      <button
+                        onClick={() => openMetodoModal(emp.id)}
+                        className="p-1.5 rounded-sm"
+                        style={{ color: ink + "77", border: `1px solid ${ink}22` }}
+                        title="Editar método de checado"
+                      >
+                        <Fingerprint size={14} />
+                      </button>
+                    )}
+                    {unlockedSession && (
+                      <button
+                        onClick={() => openAreasModal(emp.id)}
+                        className="p-1.5 rounded-sm"
+                        style={{ color: ink + "77", border: `1px solid ${ink}22` }}
+                        title="Editar áreas"
+                      >
+                        <MapPin size={14} />
+                      </button>
+                    )}
                     {unlockedSession && (
                       <button
                         onClick={() => openScheduleModal(emp.id)}
@@ -2306,6 +3593,1083 @@ export default function RelojChecador() {
               ))
             )}
           </div>
+          </div>
+
+          <div>
+            <div
+              className="text-[10px] font-bold uppercase mb-3 flex items-center gap-1.5"
+              style={{ color: brass, letterSpacing: "0.1em" }}
+            >
+              <MapPin size={12} /> Áreas
+            </div>
+              <div className="rounded-sm p-4" style={{ background: paper }}>
+                <div className="text-xs font-bold uppercase mb-1" style={{ color: ink, letterSpacing: "0.06em" }}>
+                  Áreas del local
+                </div>
+                <p className="text-[10px] mb-3" style={{ color: ink + "66" }}>
+                  Las áreas que definas aquí son las que se pueden asignar a cada empleado, y con las
+                  que se agrupa el selector del Checador.
+                </p>
+
+                {unlockedSession && (
+                  <div className="flex items-center gap-2 mb-3">
+                    <input
+                      value={newAreaName}
+                      onChange={(e) => setNewAreaName(e.target.value)}
+                      placeholder="Nueva área (ej. Terraza, Caja)"
+                      className="flex-1 px-3 py-2 rounded-sm text-sm outline-none"
+                      style={{ border: `1px solid ${ink}33`, background: "#fff", color: ink }}
+                    />
+                    <button
+                      onClick={addAreaToList}
+                      disabled={!newAreaName.trim() || areasList.includes(newAreaName.trim())}
+                      className="p-2.5 rounded-sm disabled:opacity-40"
+                      style={{ background: brass, color: ink }}
+                    >
+                      <Plus size={16} />
+                    </button>
+                  </div>
+                )}
+
+                <div className="flex flex-col gap-2">
+                  {loadingAreas ? (
+                    <div className="flex items-center gap-2 text-sm" style={{ color: steel }}>
+                      <Loader2 size={16} className="animate-spin" /> Cargando…
+                    </div>
+                  ) : areasList.length === 0 ? (
+                    <div className="text-sm py-4 text-center" style={{ color: ink + "66" }}>
+                      Todavía no hay áreas configuradas.
+                    </div>
+                  ) : (
+                    areasList.map((area, idx) => {
+                      const personasEnArea = employees.filter((e) => (e.areas || []).includes(area)).length;
+                      return (
+                        <div
+                          key={area + idx}
+                          className="flex items-center justify-between px-3 py-2 rounded-sm"
+                          style={{ background: ink + "06" }}
+                        >
+                          {editingAreaIdx === idx ? (
+                            <div className="flex items-center gap-2 flex-1">
+                              <input
+                                value={editingAreaValue}
+                                onChange={(e) => setEditingAreaValue(e.target.value)}
+                                autoFocus
+                                className="flex-1 px-2 py-1.5 rounded-sm text-xs outline-none"
+                                style={{ border: `1px solid ${ink}33`, background: "#fff", color: ink }}
+                              />
+                              <button onClick={saveEditArea} className="p-1.5 rounded-sm" style={{ background: sage, color: paper }}>
+                                <Check size={13} />
+                              </button>
+                              <button
+                                onClick={() => setEditingAreaIdx(null)}
+                                className="p-1.5 rounded-sm"
+                                style={{ border: `1px solid ${ink}33`, color: ink }}
+                              >
+                                <X size={13} />
+                              </button>
+                            </div>
+                          ) : (
+                            <>
+                              <div>
+                                <div className="text-xs font-bold" style={{ color: ink }}>
+                                  {area}
+                                </div>
+                                <div className="text-[10px]" style={{ color: ink + "66" }}>
+                                  {personasEnArea} {personasEnArea === 1 ? "persona" : "personas"}
+                                </div>
+                              </div>
+                              <div className="flex items-center gap-2 flex-shrink-0">
+                                <div className="flex items-center gap-1">
+                                  <span className="text-[9px] uppercase" style={{ color: ink + "66" }}>
+                                    Mínimo
+                                  </span>
+                                  <input
+                                    value={areaMinimos[area] ?? ""}
+                                    onChange={(e) => setAreaMinimo(area, e.target.value.replace(/\D/g, ""))}
+                                    disabled={!unlockedSession}
+                                    inputMode="numeric"
+                                    placeholder="0"
+                                    className="w-10 px-1.5 py-1 rounded-sm text-[11px] text-center outline-none disabled:opacity-60"
+                                    style={{ border: `1px solid ${ink}33`, background: "#fff", color: ink }}
+                                  />
+                                </div>
+                              {unlockedSession && (
+                                <div className="flex items-center gap-1">
+                                  <button
+                                    onClick={() => startEditArea(idx)}
+                                    className="p-1.5 rounded-sm"
+                                    style={{ color: ink + "77" }}
+                                  >
+                                    <Pencil size={13} />
+                                  </button>
+                                  {confirmDeleteAreaIdx === idx ? (
+                                    <>
+                                      <button
+                                        onClick={() => deleteArea(idx)}
+                                        className="p-1.5 rounded-sm"
+                                        style={{ background: paprika, color: paper }}
+                                      >
+                                        <Check size={13} />
+                                      </button>
+                                      <button
+                                        onClick={() => setConfirmDeleteAreaIdx(null)}
+                                        className="p-1.5 rounded-sm"
+                                        style={{ background: steel + "33", color: ink }}
+                                      >
+                                        <X size={13} />
+                                      </button>
+                                    </>
+                                  ) : (
+                                    <button
+                                      onClick={() => setConfirmDeleteAreaIdx(idx)}
+                                      className="p-1.5 rounded-sm"
+                                      style={{ color: ink + "55" }}
+                                    >
+                                      <Trash2 size={13} />
+                                    </button>
+                                  )}
+                                </div>
+                              )}
+                              </div>
+                            </>
+                          )}
+                        </div>
+                      );
+                    })
+                  )}
+                </div>
+              </div>
+          </div>
+
+          <div>
+            <div
+              className="text-[10px] font-bold uppercase mb-3 flex items-center gap-1.5"
+              style={{ color: brass, letterSpacing: "0.1em" }}
+            >
+              <CalendarClock size={12} /> Horario
+            </div>
+              <div className="rounded-sm p-4" style={{ background: paper }}>
+                <div className="text-xs font-bold uppercase mb-1" style={{ color: ink, letterSpacing: "0.06em" }}>
+                  Horario por día
+                </div>
+                <p className="text-[10px] mb-3" style={{ color: ink + "66" }}>
+                  Revisa y ajusta quién trabaja cada día, según lo que necesite el local — sin entrar
+                  empleado por empleado.
+                </p>
+
+                <button
+                  onClick={toggleTurnosHabilitado}
+                  disabled={!unlockedSession}
+                  className="w-full flex items-center justify-between px-3 py-2 rounded-sm mb-3 disabled:opacity-60"
+                  style={{
+                    background: turnosConfig.habilitado ? sage + "14" : ink + "06",
+                    border: `1px solid ${turnosConfig.habilitado ? sage + "55" : ink + "11"}`,
+                  }}
+                >
+                  <span className="text-xs font-bold" style={{ color: ink }}>
+                    Multihorarios (turno matutino / medio / nocturno)
+                  </span>
+                  <span
+                    className="rounded-full flex-shrink-0"
+                    style={{
+                      width: 30,
+                      height: 17,
+                      background: turnosConfig.habilitado ? sage : steel + "55",
+                      position: "relative",
+                    }}
+                  >
+                    <span
+                      className="rounded-full absolute"
+                      style={{
+                        width: 13,
+                        height: 13,
+                        top: 2,
+                        left: turnosConfig.habilitado ? 15 : 2,
+                        background: "#fff",
+                        transition: "left 0.15s",
+                      }}
+                    />
+                  </span>
+                </button>
+
+                {turnosConfig.habilitado && (
+                  <div className="mb-3 flex flex-col gap-1.5">
+                    {turnosConfig.turnos.map((t) => (
+                      <div key={t.id} className="flex items-center gap-1.5">
+                        <span className="text-[11px] font-bold flex-1" style={{ color: ink }}>
+                          {t.nombre}
+                        </span>
+                        <input
+                          type="time"
+                          value={t.start}
+                          disabled={!unlockedSession}
+                          onChange={(e) => updateTurnoDefinicion(t.id, { start: e.target.value })}
+                          className="px-1.5 py-1 rounded-sm text-[11px] outline-none disabled:opacity-60"
+                          style={{ border: `1px solid ${ink}33`, background: "#fff", color: ink, width: "5.2rem" }}
+                        />
+                        <span className="text-[10px]" style={{ color: ink + "55" }}>
+                          a
+                        </span>
+                        <input
+                          type="time"
+                          value={t.end}
+                          disabled={!unlockedSession}
+                          onChange={(e) => updateTurnoDefinicion(t.id, { end: e.target.value })}
+                          className="px-1.5 py-1 rounded-sm text-[11px] outline-none disabled:opacity-60"
+                          style={{ border: `1px solid ${ink}33`, background: "#fff", color: ink, width: "5.2rem" }}
+                        />
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                <div className="flex gap-1.5 mb-3 overflow-x-auto pb-1">
+                  {DAY_NAMES.map((name, idx) => (
+                    <button
+                      key={idx}
+                      onClick={() => setHorarioDiaSeleccionado(idx)}
+                      className="px-3 py-1.5 rounded-sm text-xs font-bold flex-shrink-0"
+                      style={{
+                        background: horarioDiaSeleccionado === idx ? brass : "transparent",
+                        border: `1px solid ${horarioDiaSeleccionado === idx ? brass : ink + "33"}`,
+                        color: ink,
+                      }}
+                    >
+                      {DAY_SHORT[idx]}
+                    </button>
+                  ))}
+                </div>
+                <div className="text-[11px] font-bold mb-2" style={{ color: ink + "88" }}>
+                  {DAY_NAMES[horarioDiaSeleccionado]}
+                </div>
+
+                {areasList.length > 0 && (
+                  <div className="flex flex-wrap gap-1.5 mb-3">
+                    {areasList.map((area) => {
+                      const minimo = areaMinimos[area] || 0;
+                      const programados = employees.filter((e) => {
+                        if (!e.active || !(e.areas || []).includes(area)) return false;
+                        const d = getScheduleForDate(e, today)?.[horarioDiaSeleccionado];
+                        return d?.enabled;
+                      }).length;
+                      const cumple = minimo === 0 || programados >= minimo;
+                      return (
+                        <div
+                          key={area}
+                          className="px-2 py-1 rounded-sm text-[10px] font-bold"
+                          style={{
+                            background: cumple ? sage + "14" : paprika + "14",
+                            color: cumple ? sage : paprika,
+                            border: `1px solid ${cumple ? sage + "55" : paprika + "55"}`,
+                          }}
+                        >
+                          {area}: {programados}
+                          {minimo > 0 ? `/${minimo}` : ""}
+                          {!cumple && " ⚠"}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+
+                <div className="flex flex-col gap-2">
+                  {employees.filter((e) => e.active).length === 0 ? (
+                    <div className="text-sm py-4 text-center" style={{ color: ink + "66" }}>
+                      No hay personal activo todavía.
+                    </div>
+                  ) : (
+                    employees
+                      .filter((e) => e.active)
+                      .map((emp) => {
+                        const daySchedule = getScheduleForDate(emp, today)?.[horarioDiaSeleccionado] || {
+                          enabled: false,
+                          start: "09:00",
+                          end: "17:00",
+                        };
+                        return (
+                          <div
+                            key={emp.id}
+                            className="flex flex-col gap-1.5 px-3 py-2 rounded-sm"
+                            style={{ background: ink + "06" }}
+                          >
+                            <div className="flex items-center gap-2">
+                              <button
+                                disabled={!unlockedSession}
+                                onClick={() => quickUpdateEmployeeDay(emp.id, horarioDiaSeleccionado, { enabled: !daySchedule.enabled })}
+                                className="rounded-sm flex-shrink-0 disabled:opacity-50"
+                                style={{
+                                  width: 16,
+                                  height: 16,
+                                  border: `2px solid ${daySchedule.enabled ? sage : steel}`,
+                                  background: daySchedule.enabled ? sage : "transparent",
+                                }}
+                              />
+                              <span className="text-xs font-bold flex-1 truncate" style={{ color: ink }}>
+                                {emp.name}
+                              </span>
+                              {daySchedule.enabled ? (
+                                <div className="flex items-center gap-1">
+                                  <input
+                                    type="time"
+                                    value={daySchedule.start}
+                                    disabled={!unlockedSession}
+                                    onChange={(e) => quickUpdateEmployeeDay(emp.id, horarioDiaSeleccionado, { start: e.target.value })}
+                                    className="px-1.5 py-1 rounded-sm text-[11px] outline-none disabled:opacity-60"
+                                    style={{ border: `1px solid ${ink}33`, background: "#fff", color: ink, width: "5.2rem" }}
+                                  />
+                                  <span className="text-[10px]" style={{ color: ink + "55" }}>
+                                    a
+                                  </span>
+                                  <input
+                                    type="time"
+                                    value={daySchedule.end}
+                                    disabled={!unlockedSession}
+                                    onChange={(e) => quickUpdateEmployeeDay(emp.id, horarioDiaSeleccionado, { end: e.target.value })}
+                                    className="px-1.5 py-1 rounded-sm text-[11px] outline-none disabled:opacity-60"
+                                    style={{ border: `1px solid ${ink}33`, background: "#fff", color: ink, width: "5.2rem" }}
+                                  />
+                                </div>
+                              ) : (
+                                <span className="text-[10px]" style={{ color: ink + "55" }}>
+                                  Descanso
+                                </span>
+                              )}
+                            </div>
+                            {turnosConfig.habilitado && daySchedule.enabled && (
+                              <div className="flex items-center gap-1.5 pl-6">
+                                {turnosConfig.turnos.map((t) => {
+                                  const selected = daySchedule.turno === t.id;
+                                  return (
+                                    <button
+                                      key={t.id}
+                                      disabled={!unlockedSession}
+                                      onClick={() =>
+                                        quickUpdateEmployeeDay(emp.id, horarioDiaSeleccionado, {
+                                          turno: t.id,
+                                          start: t.start,
+                                          end: t.end,
+                                        })
+                                      }
+                                      className="px-2 py-1 rounded-sm text-[10px] font-bold disabled:opacity-60"
+                                      style={{
+                                        background: selected ? brass : "transparent",
+                                        border: `1px solid ${selected ? brass : ink + "33"}`,
+                                        color: ink,
+                                      }}
+                                    >
+                                      {t.nombre}
+                                    </button>
+                                  );
+                                })}
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })
+                  )}
+                </div>
+                {!unlockedSession && (
+                  <p className="text-[10px] mt-3" style={{ color: ink + "66" }}>
+                    Desbloquea con tu clave arriba para poder editar horarios desde aquí.
+                  </p>
+                )}
+              </div>
+          </div>
+        </div>
+      )}
+
+      {/* ---------------- NOMINA TAB ---------------- */}
+      {tab === "nomina" && (
+        <div className="flex-1 px-5 py-5 flex flex-col min-h-0 overflow-y-auto">
+          {!payrollSelectedEmployeeId ? (
+            <>
+              <div className="rounded-sm p-4 mb-4" style={{ background: paper }}>
+                <div className="flex items-center justify-between mb-1">
+                  <div className="flex items-center gap-1.5">
+                    <Building2 size={13} color={ink} />
+                    <div className="text-[11px] font-bold uppercase" style={{ color: ink, letterSpacing: "0.05em" }}>
+                      Datos del negocio (para recibos)
+                    </div>
+                  </div>
+                  {!showBusinessConfigEdit && (
+                    <button
+                      onClick={() => requestUnlock("business_config_editar")}
+                      className="flex items-center gap-1 text-[10px] font-bold uppercase px-2.5 py-1.5 rounded-sm flex-shrink-0"
+                      style={{ border: `1px solid ${ink}33`, color: ink }}
+                    >
+                      <Lock size={11} /> Editar
+                    </button>
+                  )}
+                </div>
+
+                {!showBusinessConfigEdit ? (
+                  <div className="flex items-center gap-3 mt-2">
+                    {businessLogo ? (
+                      <img src={businessLogo} alt="Logo" className="rounded-sm object-contain flex-shrink-0" style={{ width: 40, height: 40, background: "#fff" }} />
+                    ) : (
+                      <div className="rounded-sm flex items-center justify-center flex-shrink-0" style={{ width: 40, height: 40, background: ink + "0d" }}>
+                        <Building2 size={16} color={ink + "55"} />
+                      </div>
+                    )}
+                    <div className="text-xs" style={{ color: ink }}>
+                      <div className="font-bold">{businessConfig.nombre || "Sin nombre configurado"}</div>
+                      <div style={{ color: ink + "77" }}>{businessConfig.direccion || "Sin dirección"}</div>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="mt-2 flex flex-col gap-2">
+                    <div className="flex items-center gap-3">
+                      {businessLogo ? (
+                        <img src={businessLogo} alt="Logo" className="rounded-sm object-contain flex-shrink-0" style={{ width: 44, height: 44, background: "#fff", border: `1px solid ${ink}22` }} />
+                      ) : (
+                        <div className="rounded-sm flex items-center justify-center flex-shrink-0" style={{ width: 44, height: 44, background: ink + "0d" }}>
+                          <Building2 size={18} color={ink + "55"} />
+                        </div>
+                      )}
+                      <div className="flex flex-col gap-1">
+                        <label
+                          htmlFor="business-logo-input"
+                          className="text-[10px] font-bold uppercase px-2.5 py-1.5 rounded-sm cursor-pointer text-center"
+                          style={{ border: `1px solid ${ink}33`, color: ink }}
+                        >
+                          {businessLogo ? "Cambiar logo" : "Subir logo"}
+                        </label>
+                        {businessLogo && (
+                          <button onClick={removeLogo} className="text-[10px]" style={{ color: paprika }}>
+                            Quitar logo
+                          </button>
+                        )}
+                        <input id="business-logo-input" type="file" accept="image/*" onChange={handleLogoUpload} style={{ display: "none" }} />
+                      </div>
+                    </div>
+                    <input
+                      value={businessConfigDraft.nombre}
+                      onChange={(e) => setBusinessConfigDraft((c) => ({ ...c, nombre: e.target.value }))}
+                      placeholder="Nombre del negocio"
+                      className="w-full px-2 py-1.5 rounded-sm text-xs outline-none"
+                      style={{ border: `1px solid ${ink}33`, background: "#fff", color: ink }}
+                    />
+                    <input
+                      value={businessConfigDraft.direccion}
+                      onChange={(e) => setBusinessConfigDraft((c) => ({ ...c, direccion: e.target.value }))}
+                      placeholder="Dirección"
+                      className="w-full px-2 py-1.5 rounded-sm text-xs outline-none"
+                      style={{ border: `1px solid ${ink}33`, background: "#fff", color: ink }}
+                    />
+                    <input
+                      value={businessConfigDraft.encabezado}
+                      onChange={(e) => setBusinessConfigDraft((c) => ({ ...c, encabezado: e.target.value }))}
+                      placeholder="Texto extra de encabezado (opcional, ej. RFC, teléfono)"
+                      className="w-full px-2 py-1.5 rounded-sm text-xs outline-none"
+                      style={{ border: `1px solid ${ink}33`, background: "#fff", color: ink }}
+                    />
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={saveBusinessConfig}
+                        className="text-[10px] font-bold uppercase px-3 py-1.5 rounded-sm"
+                        style={{ background: sage, color: paper }}
+                      >
+                        Guardar
+                      </button>
+                      <button
+                        onClick={() => {
+                          setShowBusinessConfigEdit(false);
+                          setBusinessConfigDraft(businessConfig);
+                        }}
+                        className="text-[10px] font-bold uppercase px-3 py-1.5 rounded-sm"
+                        style={{ border: `1px solid ${ink}33`, color: ink }}
+                      >
+                        Cancelar
+                      </button>
+                    </div>
+                  </div>
+                )}
+                <p className="text-[10px] mt-2" style={{ color: ink + "66" }}>
+                  Aparece en el encabezado de los recibos de nómina y resúmenes impresos. El logo se
+                  guarda solo en este dispositivo.
+                </p>
+              </div>
+
+              <div className="flex items-center justify-between mb-3">
+                <div className="text-[10px] font-bold uppercase" style={{ color: steel, letterSpacing: "0.1em" }}>
+                  Selecciona un empleado
+                </div>
+                <button
+                  onClick={lockNow}
+                  className="flex items-center gap-1 text-[10px] font-bold uppercase"
+                  style={{ color: steel }}
+                >
+                  <Lock size={11} /> Bloquear
+                </button>
+              </div>
+              <div className="flex flex-col gap-2 overflow-y-auto">
+                {employees.length === 0 ? (
+                  <div className="text-sm py-6 text-center" style={{ color: steel }}>
+                    No hay empleados registrados todavía.
+                  </div>
+                ) : (
+                  employees.map((emp) => (
+                    <button
+                      key={emp.id}
+                      onClick={() => openPayroll(emp.id)}
+                      className="flex items-center justify-between px-3 py-2.5 rounded-sm text-left"
+                      style={{ background: paper }}
+                    >
+                      <div className="min-w-0">
+                        <div className="text-sm font-bold truncate" style={{ color: ink }}>
+                          {emp.name}
+                        </div>
+                        <div className="text-[11px]" style={{ color: ink + "88" }}>
+                          {emp.puesto}
+                          {emp.payroll?.rateAmount ? (
+                            <>
+                              {" · "}
+                              {formatMoney(emp.payroll.rateAmount)} por {emp.payroll.rateType === "hora" ? "hora" : "jornada"}
+                            </>
+                          ) : (
+                            " · sin tarifa configurada"
+                          )}
+                        </div>
+                      </div>
+                      <ChevronRight size={16} color={ink + "55"} />
+                    </button>
+                  ))
+                )}
+              </div>
+            </>
+          ) : (
+            <PayrollPanel
+              employee={employees.find((e) => e.id === payrollSelectedEmployeeId)}
+              draft={payrollDraft}
+              employees={employees}
+              recordsByDate={recordsByDate}
+              propinasHistorial={propinasHistorial}
+              propinasConfig={propinasConfig}
+              onBack={closePayroll}
+              onChange={updatePayrollDraft}
+              onAddLine={addLineItem}
+              onUpdateLine={updateLineItem}
+              onRemoveLine={removeLineItem}
+              onSaveConfig={savePayrollConfig}
+              onGenerate={handleGeneratePayroll}
+              colors={{ paprika, sage, ink, paper, brass, steel }}
+            />
+          )}
+        </div>
+      )}
+
+      {/* ---------------- PROPINAS TAB ---------------- */}
+      {tab === "propinas" && (
+        <div className="flex-1 px-5 py-5 flex flex-col gap-4 overflow-y-auto">
+          <div className="rounded-sm p-4" style={{ background: paper }}>
+            <div className="flex items-center justify-between mb-1">
+              <div className="text-[11px] font-bold uppercase" style={{ color: ink, letterSpacing: "0.05em" }}>
+                Configuración de propinas
+              </div>
+              {!showPropinasConfigEdit && (
+                <button
+                  onClick={() => requestUnlock("propinas_config_editar")}
+                  className="flex items-center gap-1 text-[10px] font-bold uppercase px-2.5 py-1.5 rounded-sm flex-shrink-0"
+                  style={{ border: `1px solid ${ink}33`, color: ink }}
+                >
+                  <Lock size={11} /> Editar
+                </button>
+              )}
+            </div>
+
+            {!showPropinasConfigEdit ? (
+              <div className="flex flex-col gap-1 mt-2 text-xs" style={{ color: ink }}>
+                <div>
+                  Tolerancia de puntualidad: <strong style={{ color: sage }}>{propinasConfig.toleranciaMin} min</strong>
+                </div>
+                <div>
+                  Frecuencia de reparto:{" "}
+                  <strong>
+                    {propinasConfig.frecuencia === "semanal"
+                      ? "Semanal"
+                      : propinasConfig.frecuencia === "mensual"
+                      ? "Mensual"
+                      : "Diaria"}
+                  </strong>
+                </div>
+                <div>
+                  Entrega:{" "}
+                  <strong>
+                    {propinasConfig.modoEntrega === "nomina" ? "Junto con la nómina del periodo" : "Diaria e independiente"}
+                  </strong>
+                </div>
+              </div>
+            ) : (
+              <div className="flex flex-col gap-2 mt-2">
+                <div className="flex items-center gap-2">
+                  <span className="text-[11px] flex-1" style={{ color: ink + "88" }}>
+                    Tolerancia (minutos):
+                  </span>
+                  <input
+                    value={propinasConfigDraft.toleranciaMin}
+                    onChange={(e) =>
+                      setPropinasConfigDraft((d) => ({ ...d, toleranciaMin: e.target.value.replace(/[^0-9]/g, "") }))
+                    }
+                    inputMode="numeric"
+                    className="w-20 px-2 py-1.5 rounded-sm text-xs outline-none"
+                    style={{ border: `1px solid ${ink}33`, background: "#fff", color: ink }}
+                  />
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="text-[11px] flex-1" style={{ color: ink + "88" }}>
+                    Frecuencia de reparto:
+                  </span>
+                  <select
+                    value={propinasConfigDraft.frecuencia}
+                    onChange={(e) => setPropinasConfigDraft((d) => ({ ...d, frecuencia: e.target.value }))}
+                    className="flex-1 px-2 py-1.5 rounded-sm text-xs outline-none"
+                    style={{ border: `1px solid ${ink}33`, background: "#fff", color: ink }}
+                  >
+                    <option value="diaria">Diaria</option>
+                    <option value="semanal">Semanal</option>
+                    <option value="mensual">Mensual</option>
+                  </select>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="text-[11px] flex-1" style={{ color: ink + "88" }}>
+                    Entrega:
+                  </span>
+                  <select
+                    value={propinasConfigDraft.modoEntrega}
+                    onChange={(e) => setPropinasConfigDraft((d) => ({ ...d, modoEntrega: e.target.value }))}
+                    className="flex-1 px-2 py-1.5 rounded-sm text-xs outline-none"
+                    style={{ border: `1px solid ${ink}33`, background: "#fff", color: ink }}
+                  >
+                    <option value="diaria">Diaria e independiente</option>
+                    <option value="nomina">Junto con la nómina</option>
+                  </select>
+                </div>
+                <div className="flex items-center gap-2 mt-1">
+                  <button
+                    onClick={savePropinasConfig}
+                    className="text-[10px] font-bold uppercase px-3 py-1.5 rounded-sm"
+                    style={{ background: sage, color: paper }}
+                  >
+                    Guardar
+                  </button>
+                  <button
+                    onClick={() => {
+                      setShowPropinasConfigEdit(false);
+                      setPropinasConfigDraft({ ...propinasConfig, toleranciaMin: String(propinasConfig.toleranciaMin) });
+                    }}
+                    className="text-[10px] font-bold uppercase px-3 py-1.5 rounded-sm"
+                    style={{ border: `1px solid ${ink}33`, color: ink }}
+                  >
+                    Cancelar
+                  </button>
+                </div>
+              </div>
+            )}
+            <p className="text-[10px] mt-2" style={{ color: ink + "66" }}>
+              Cualquiera puede ver esta configuración; solo con la clave se puede cambiar.
+            </p>
+          </div>
+
+          <div className="rounded-sm p-4" style={{ background: paper }}>
+            <div className="text-[11px] font-bold uppercase mb-3" style={{ color: ink, letterSpacing: "0.05em" }}>
+              Reparto de propinas
+              {propinasConfig.frecuencia !== "diaria" && ` (${propinasConfig.frecuencia})`}
+            </div>
+            <div className="flex items-center gap-2 mb-2">
+              <input
+                type="date"
+                value={propinasPeriodoInicio}
+                onChange={(e) => setPropinasPeriodoInicio(e.target.value)}
+                className="flex-1 px-2 py-1.5 rounded-sm text-xs outline-none"
+                style={{ border: `1px solid ${ink}33`, background: "#fff", color: ink }}
+              />
+              {propinasConfig.frecuencia !== "diaria" && (
+                <>
+                  <span className="text-[10px]" style={{ color: ink + "66" }}>
+                    a
+                  </span>
+                  <input
+                    type="date"
+                    value={propinasPeriodoFin}
+                    onChange={(e) => setPropinasPeriodoFin(e.target.value)}
+                    className="flex-1 px-2 py-1.5 rounded-sm text-xs outline-none"
+                    style={{ border: `1px solid ${ink}33`, background: "#fff", color: ink }}
+                  />
+                </>
+              )}
+              <input
+                value={propinasMonto}
+                onChange={(e) => setPropinasMonto(e.target.value.replace(/[^0-9.]/g, ""))}
+                placeholder="Monto total"
+                inputMode="decimal"
+                className="flex-1 px-2 py-1.5 rounded-sm text-xs outline-none"
+                style={{ border: `1px solid ${ink}33`, background: "#fff", color: ink }}
+              />
+            </div>
+
+            {(() => {
+              const monto = Number(propinasMonto) || 0;
+              const fin = propinasConfig.frecuencia === "diaria" ? propinasPeriodoInicio : propinasPeriodoFin;
+              const { lista, sobrante } = calcularRepartoPropinas(propinasPeriodoInicio, fin, monto, employees, recordsByDate, externosPorDia);
+              return (
+                <>
+                  {lista.length === 0 ? (
+                    <p className="text-xs py-3 text-center" style={{ color: ink + "77" }}>
+                      Nadie ha checado entrada en ese periodo todavía.
+                    </p>
+                  ) : (
+                    <div className="flex flex-col gap-1.5 mt-2">
+                      {lista.map((p) => (
+                        <div
+                          key={p.employeeId}
+                          className="flex items-center justify-between px-3 py-2 rounded-sm"
+                          style={{ background: p.tieneCorreccion ? brass + "1c" : p.califica ? sage + "14" : ink + "06" }}
+                        >
+                          <div>
+                            <div className="flex items-center gap-1.5">
+                              <span className="text-xs font-bold" style={{ color: ink }}>
+                                {p.employeeName}
+                              </span>
+                              {p.tieneCorreccion && (
+                                <span
+                                  className="text-[9px] font-bold uppercase px-1.5 py-0.5 rounded-sm"
+                                  style={{ background: brass, color: ink }}
+                                  title="Incluye una corrección manual de puntualidad"
+                                >
+                                  Corregido
+                                </span>
+                              )}
+                            </div>
+                            <div className="text-[10px]" style={{ color: p.califica ? ink + "77" : paprika }}>
+                              {p.diasPropina}/{p.diasTrabajados} días elegibles
+                            </div>
+                          </div>
+                          <div className="text-sm font-bold" style={{ color: p.califica ? sage : ink + "44" }}>
+                            {formatMoney(p.monto)}
+                          </div>
+                        </div>
+                      ))}
+                      {monto > 0 && sobrante > 0 && (
+                        <p className="text-[10px] mt-1" style={{ color: ink + "66" }}>
+                          Sobrante sin repartir (redondeo hacia abajo): {formatMoney(sobrante)}
+                        </p>
+                      )}
+                    </div>
+                  )}
+
+                  <input
+                    value={propinasQuien}
+                    onChange={(e) => setPropinasQuien(e.target.value)}
+                    placeholder="¿Quién realiza esta operación? (obligatorio)"
+                    className="w-full mt-3 px-2 py-1.5 rounded-sm text-xs outline-none"
+                    style={{ border: `1px solid ${ink}33`, background: "#fff", color: ink }}
+                  />
+                  <button
+                    onClick={() => guardarReparto(propinasPeriodoInicio, fin, monto, lista, propinasQuien)}
+                    disabled={!propinasQuien.trim() || monto <= 0}
+                    className="w-full flex items-center justify-center gap-2 py-2.5 mt-2 rounded-sm font-bold text-xs uppercase disabled:opacity-40"
+                    style={{ background: brass, color: ink }}
+                  >
+                    <Coins size={14} /> Guardar reparto
+                  </button>
+                  {propinasConfig.modoEntrega === "nomina" && (
+                    <p className="text-[10px] mt-2" style={{ color: brass }}>
+                      Con la entrega en modo "junto con la nómina", este monto no se paga aparte — se
+                      suma solo cuando generes el recibo de nómina de cada quien para este periodo.
+                    </p>
+                  )}
+                </>
+              );
+            })()}
+          </div>
+
+          {/* personal externo (temporal) — requiere PIN */}
+          <div className="rounded-sm p-4" style={{ background: paper }}>
+            <div className="flex items-center justify-between mb-3">
+              <div className="text-[11px] font-bold uppercase" style={{ color: ink, letterSpacing: "0.05em" }}>
+                Personal Externo ({propinasFecha})
+              </div>
+              {unlockedSession && (
+                <button onClick={lockNow} className="flex items-center gap-1 text-[10px] font-bold uppercase" style={{ color: steel }}>
+                  <Lock size={11} /> Bloquear
+                </button>
+              )}
+            </div>
+
+            {!unlockedSession ? (
+              <button
+                onClick={() => requestUnlock("propinas")}
+                className="w-full rounded-sm p-4 flex items-center gap-3 text-left"
+                style={{ background: paper }}
+              >
+                <div className="rounded-full flex items-center justify-center flex-shrink-0" style={{ width: 34, height: 34, background: brass + "33" }}>
+                  <Lock size={16} color={ink} />
+                </div>
+                <div>
+                  <div className="text-sm font-bold" style={{ color: ink }}>
+                    Requiere clave de acceso
+                  </div>
+                  <div className="text-[11px]" style={{ color: ink + "88" }}>
+                    Toca para desbloquear y agregar personal
+                  </div>
+                </div>
+              </button>
+            ) : (
+              <>
+                <div className="flex items-center gap-2 mb-3">
+                  <input
+                    type="date"
+                    value={propinasFecha}
+                    onChange={(e) => setPropinasFecha(e.target.value)}
+                    className="flex-1 px-2 py-1.5 rounded-sm text-xs outline-none"
+                    style={{ border: `1px solid ${ink}33`, background: "#fff", color: ink }}
+                  />
+                </div>
+
+                {externosPorDia.filter((e) => e.fecha === propinasFecha).length > 0 && (
+                  <div className="flex flex-col gap-1.5 mb-2">
+                    {externosPorDia.filter((e) => e.fecha === propinasFecha).map((e) => (
+                      <div key={e.id} className="flex items-center justify-between px-3 py-2 rounded-sm" style={{ background: sage + "18" }}>
+                        <span className="text-xs font-bold" style={{ color: ink }}>{e.nombre}</span>
+                        <button onClick={() => quitarExternoDelDia(e.id)}>
+                          <X size={14} color={paprika} />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {externosCatalogo.filter((ext) => !externosPorDia.some((e) => e.fecha === propinasFecha && e.externoId === ext.id)).length > 0 && (
+                  <div className="mb-2">
+                    <div className="text-[10px] mb-1" style={{ color: ink + "88" }}>Recurrentes — toca para agregar:</div>
+                    <div className="flex flex-wrap gap-1.5">
+                      {externosCatalogo
+                        .filter((ext) => !externosPorDia.some((e) => e.fecha === propinasFecha && e.externoId === ext.id))
+                        .map((ext) => (
+                          <button
+                            key={ext.id}
+                            onClick={() => agregarExternoAlDia(ext)}
+                            className="px-3 py-1.5 rounded-sm text-xs font-bold"
+                            style={{ border: `1px solid ${ink}33`, color: ink }}
+                          >
+                            + {ext.nombre}
+                          </button>
+                        ))}
+                    </div>
+                  </div>
+                )}
+
+                <div className="flex gap-2">
+                  <input
+                    value={nuevoExternoNombre}
+                    onChange={(e) => setNuevoExternoNombre(e.target.value)}
+                    onKeyDown={(e) => e.key === "Enter" && crearYAgregarExterno()}
+                    placeholder="Nombre de la persona externa"
+                    className="flex-1 px-3 py-2 rounded-sm text-sm outline-none"
+                    style={{ border: `1px solid ${ink}33`, background: "#fff", color: ink }}
+                  />
+                  <button
+                    onClick={crearYAgregarExterno}
+                    disabled={!nuevoExternoNombre.trim()}
+                    className="px-3 rounded-sm font-bold text-sm disabled:opacity-40"
+                    style={{ background: brass, color: ink }}
+                  >
+                    <Plus size={16} />
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+
+          {/* corrección manual de puntualidad — solo superusuario (PIN) */}
+          <div className="rounded-sm p-4" style={{ background: paper }}>
+            <div className="flex items-center justify-between mb-1">
+              <div className="text-[11px] font-bold uppercase" style={{ color: ink, letterSpacing: "0.05em" }}>
+                Ajuste manual (superusuario)
+              </div>
+              {!showAjusteManual && (
+                <button
+                  onClick={() => requestUnlock("propinas_ajuste_manual")}
+                  className="flex items-center gap-1 text-[10px] font-bold uppercase px-2.5 py-1.5 rounded-sm flex-shrink-0"
+                  style={{ border: `1px solid ${ink}33`, color: ink }}
+                >
+                  <Lock size={11} /> Abrir
+                </button>
+              )}
+            </div>
+
+            {!showAjusteManual ? (
+              <p className="text-[10px] mt-1" style={{ color: ink + "66" }}>
+                Para corregir un día específico cuando un error ajeno a la persona (falla al checar,
+                etc.) le impidió calificar para bono o propina. Requiere la clave.
+              </p>
+            ) : (
+              <div className="mt-2 flex flex-col gap-2">
+                <p className="text-[10px]" style={{ color: ink + "77" }}>
+                  Corrige el registro de esa entrada — el cambio se refleja solo en Bitácora, Nómina y
+                  Propinas, no es un cálculo aparte.
+                </p>
+                <div className="flex items-center gap-2">
+                  <select
+                    value={ajusteEmpleadoId}
+                    onChange={(e) => setAjusteEmpleadoId(e.target.value)}
+                    className="flex-1 px-2 py-1.5 rounded-sm text-xs outline-none"
+                    style={{ border: `1px solid ${ink}33`, background: "#fff", color: ink }}
+                  >
+                    <option value="">Selecciona empleado…</option>
+                    {employees.map((e) => (
+                      <option key={e.id} value={e.id}>
+                        {e.name}
+                      </option>
+                    ))}
+                  </select>
+                  <input
+                    type="date"
+                    value={ajusteFecha}
+                    onChange={(e) => setAjusteFecha(e.target.value)}
+                    className="px-2 py-1.5 rounded-sm text-xs outline-none"
+                    style={{ border: `1px solid ${ink}33`, background: "#fff", color: ink }}
+                  />
+                </div>
+
+                <div className="flex flex-col gap-1.5">
+                  <label className="flex items-center gap-2 text-xs" style={{ color: ink }}>
+                    <input
+                      type="checkbox"
+                      checked={ajusteBono}
+                      onChange={(e) => {
+                        setAjusteBono(e.target.checked);
+                        if (e.target.checked) setAjustePropina(true); // el bono ya da derecho a propina
+                      }}
+                    />
+                    Bono de puntualidad
+                  </label>
+                  <label className="flex items-center gap-2 text-xs" style={{ color: ink }}>
+                    <input
+                      type="checkbox"
+                      checked={ajustePropina}
+                      disabled={ajusteBono}
+                      onChange={(e) => setAjustePropina(e.target.checked)}
+                    />
+                    Propina
+                  </label>
+                  {ajusteBono && (
+                    <p className="text-[9px]" style={{ color: ink + "66" }}>
+                      El bono ya incluye el derecho a propina, por eso quedó marcada también.
+                    </p>
+                  )}
+                </div>
+
+                <input
+                  value={ajusteMotivo}
+                  onChange={(e) => setAjusteMotivo(e.target.value)}
+                  placeholder="Motivo del ajuste (obligatorio, ej. falla al checar)"
+                  className="w-full px-2 py-1.5 rounded-sm text-xs outline-none"
+                  style={{ border: `1px solid ${ink}33`, background: "#fff", color: ink }}
+                />
+                <button
+                  onClick={aplicarCorreccionManual}
+                  disabled={!ajusteEmpleadoId || !ajusteFecha || !ajusteMotivo.trim() || (!ajusteBono && !ajustePropina)}
+                  className="flex items-center justify-center gap-2 py-2 rounded-sm font-bold text-xs uppercase disabled:opacity-40"
+                  style={{ background: brass, color: ink }}
+                >
+                  Aplicar corrección
+                </button>
+
+                {ajustesLog.length > 0 && (
+                  <div className="flex flex-col gap-1.5 mt-1 max-h-40 overflow-y-auto">
+                    {ajustesLog.slice(0, 10).map((a) => (
+                      <div key={a.id} className="px-2 py-1.5 rounded-sm" style={{ background: brass + "1c" }}>
+                        <div className="text-[10px]" style={{ color: ink }}>
+                          <strong>{a.employeeName}</strong> · {formatDateLabel(a.fecha, today)} ·{" "}
+                          {a.bono ? "Bono + propina" : "Propina"}
+                        </div>
+                        <div className="text-[9px]" style={{ color: ink + "77" }}>
+                          {a.motivo}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                <button
+                  onClick={() => setShowAjusteManual(false)}
+                  className="text-[10px] font-bold uppercase self-start"
+                  style={{ color: ink + "77" }}
+                >
+                  Ocultar
+                </button>
+              </div>
+            )}
+          </div>
+
+          {/* bitácora de propinas — protegida por PIN */}
+          <div className="rounded-sm p-4" style={{ background: paper }}>
+            <div className="flex items-center justify-between mb-1">
+              <div className="text-[11px] font-bold uppercase" style={{ color: ink, letterSpacing: "0.05em" }}>
+                Bitácora de propinas
+              </div>
+              {showPropinasHistorial && (
+                <button
+                  onClick={() => setShowPropinasHistorial(false)}
+                  className="flex items-center gap-1 text-[10px] font-bold uppercase"
+                  style={{ color: ink + "77" }}
+                >
+                  <Lock size={11} /> Ocultar
+                </button>
+              )}
+            </div>
+
+            {!showPropinasHistorial ? (
+              <button
+                onClick={() => requestUnlock("propinas_historial")}
+                className="w-full flex items-center gap-3 py-2 text-left"
+              >
+                <div
+                  className="rounded-full flex items-center justify-center flex-shrink-0"
+                  style={{ width: 30, height: 30, background: brass + "33" }}
+                >
+                  <Lock size={14} color={ink} />
+                </div>
+                <div className="text-[11px]" style={{ color: ink + "88" }}>
+                  Protegido — toca para ingresar la clave y ver los repartos guardados.
+                </div>
+              </button>
+            ) : loadingPropinasHistorial ? (
+              <div className="flex items-center gap-2 text-sm py-2" style={{ color: steel }}>
+                <Loader2 size={16} className="animate-spin" /> Cargando…
+              </div>
+            ) : propinasHistorial.length === 0 ? (
+              <p className="text-xs py-2 text-center" style={{ color: ink + "66" }}>
+                Todavía no se ha guardado ningún reparto.
+              </p>
+            ) : (
+              <div className="flex flex-col gap-2 mt-2 max-h-64 overflow-y-auto">
+                {propinasHistorial.map((p) => {
+                  const inicio = p.fechaInicio || p.fecha;
+                  const fin = p.fechaFin || p.fecha;
+                  return (
+                    <div key={p.id} className="px-3 py-2 rounded-sm" style={{ background: ink + "06" }}>
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs font-bold" style={{ color: ink }}>
+                          {inicio === fin
+                            ? formatDateLabel(inicio, today)
+                            : `${formatDateLabel(inicio, today)} – ${formatDateLabel(fin, today)}`}
+                        </span>
+                        <span className="text-xs font-bold" style={{ color: sage }}>
+                          {formatMoney(p.monto)}
+                        </span>
+                      </div>
+                      <div className="text-[10px]" style={{ color: ink + "77" }}>
+                        Registró: {p.quien || "—"}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
         </div>
       )}
 
@@ -2323,14 +4687,9 @@ export default function RelojChecador() {
               >
                 Registrar {punchModal.type}
               </div>
-              <div className="flex items-center gap-2">
-                {punchModal.type === "entrada" && (
-                  <span className="text-[10px] font-bold" style={{ color: ink + "55" }}>Paso 1 de 2</span>
-                )}
-                <button onClick={() => setPunchModal(null)}>
-                  <X size={18} color={ink} />
-                </button>
-              </div>
+              <button onClick={() => setPunchModal(null)}>
+                <X size={18} color={ink} />
+              </button>
             </div>
 
             <div className="text-sm font-bold mb-1" style={{ color: ink }}>
@@ -2340,185 +4699,160 @@ export default function RelojChecador() {
               {formatTime(new Date().toISOString())} · Hoy
             </div>
 
-            {punchModal.type === "entrada" && !punchModal.photo && (
+            {punchModal.type === "entrada" && (selectedEmployee.areas || []).length > 1 && !punchModal.area ? (
               <div className="mb-4">
                 <p className="text-xs mb-3" style={{ color: ink + "aa" }}>
-                  Toma una foto con tu uniforme puesto para registrar la entrada.
+                  ¿En qué área trabajas hoy?
                 </p>
-                <label
-                  htmlFor="reloj-photo-input"
-                  className="w-full flex items-center justify-center gap-2 py-3 rounded-sm font-bold text-sm uppercase cursor-pointer"
-                  style={{ background: paprika, color: paper }}
-                >
-                  <Camera size={16} /> Tomar / subir foto
-                </label>
-              </div>
-            )}
-
-            {punchModal.photo && (
-              <div className="mb-4">
-                <img
-                  src={punchModal.photo}
-                  alt="Foto de uniforme"
-                  className="w-full rounded-sm object-cover mb-2"
-                  style={{ maxHeight: 220 }}
-                />
-                <label
-                  htmlFor="reloj-photo-input"
-                  className="inline-flex items-center gap-1.5 text-xs font-bold cursor-pointer"
-                  style={{ color: ink + "88" }}
-                >
-                  <RotateCcw size={13} /> Repetir foto
-                </label>
-              </div>
-            )}
-
-            {punchModal.type === "salida" && !punchModal.photo && (
-              <label
-                htmlFor="reloj-photo-input"
-                className="w-full flex items-center justify-center gap-2 py-2.5 mb-3 rounded-sm font-bold text-xs uppercase cursor-pointer"
-                style={{ border: `1px solid ${ink}33`, color: ink }}
-              >
-                <Camera size={14} /> Agregar foto (opcional)
-              </label>
-            )}
-
-            <div className="grid grid-cols-2 gap-2">
-              <button
-                onClick={() => setPunchModal(null)}
-                className="py-2.5 rounded-sm font-bold text-sm uppercase"
-                style={{ border: `1px solid ${ink}33`, color: ink }}
-              >
-                Cancelar
-              </button>
-              <button
-                onClick={confirmPunch}
-                disabled={punchModal.type === "entrada" && !punchModal.photo}
-                className="flex items-center justify-center gap-2 py-2.5 rounded-sm font-bold text-sm uppercase disabled:opacity-40"
-                style={{ background: punchModal.type === "entrada" ? paprika : sage, color: paper }}
-              >
-                <Check size={15} />
-                Confirmar
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* ---------------- AREA DEL DÍA MODAL ---------------- */}
-      {areaModal && (
-        <div
-          className="fixed inset-0 flex items-end sm:items-center justify-center z-50 p-4"
-          style={{ background: "#00000099" }}
-        >
-          <div className="w-full max-w-sm rounded-sm p-5" style={{ background: paper }}>
-            <div className="flex items-center justify-between mb-1">
-              <div className="flex items-center gap-1.5 text-xs font-bold uppercase" style={{ color: sage, letterSpacing: "0.06em" }}>
-                <Check size={13} /> Entrada registrada
-              </div>
-              <span className="text-[10px] font-bold" style={{ color: ink + "55" }}>Paso 2 de 2</span>
-            </div>
-            <div className="text-lg font-black mb-1" style={{ color: ink }}>
-              {areaModal.employeeName}
-            </div>
-            <p className="text-sm mb-4" style={{ color: ink + "aa" }}>
-              ¿Qué área vas a cubrir hoy? Con esto ya te va a salir directo en DÍA y Limpieza.
-            </p>
-            <div className="flex flex-col gap-2 mb-3">
-              {AREAS_DIA.map((a) => (
+                <div className="grid grid-cols-2 gap-2">
+                  {(selectedEmployee.areas || []).map((area) => (
+                    <button
+                      key={area}
+                      onClick={() => setPunchModal((p) => ({ ...p, area }))}
+                      className="py-2.5 rounded-sm text-xs font-bold"
+                      style={{ border: `1px solid ${ink}33`, color: ink }}
+                    >
+                      {area}
+                    </button>
+                  ))}
+                </div>
                 <button
-                  key={a}
-                  onClick={() => registrarAsignacionArea(a)}
-                  className="w-full py-3 rounded-sm text-left px-4 font-bold text-sm"
-                  style={{ border: `1px solid ${ink}22`, color: ink }}
+                  onClick={() => setPunchModal(null)}
+                  className="w-full py-2.5 mt-3 rounded-sm font-bold text-sm uppercase"
+                  style={{ border: `1px solid ${ink}33`, color: ink }}
                 >
-                  {a}
+                  Cancelar
                 </button>
-              ))}
-            </div>
-            <button
-              onClick={() => { setAreaModal(null); setSelectedEmployeeId(null); }}
-              className="w-full py-2 text-center text-xs font-bold uppercase"
-              style={{ color: ink + "66" }}
-            >
-              Omitir por ahora
-            </button>
+              </div>
+            ) : (
+              <>
+                {punchModal.type === "entrada" && (selectedEmployee.areas || []).length > 1 && punchModal.area && (
+                  <div
+                    className="text-[10px] mb-3 px-2 py-1 rounded-sm inline-block"
+                    style={{ background: brass + "22", color: ink }}
+                  >
+                    Área de hoy: <strong>{punchModal.area}</strong>
+                  </div>
+                )}
+
+                {punchModal.type === "entrada" && punchModal.metodo === "foto" && !punchModal.photo && (
+                  <div className="mb-4">
+                    <p className="text-xs mb-3" style={{ color: ink + "aa" }}>
+                      Toma una foto con tu uniforme puesto para registrar la entrada.
+                    </p>
+                    <label
+                      htmlFor="reloj-photo-input"
+                      className="w-full flex items-center justify-center gap-2 py-3 rounded-sm font-bold text-sm uppercase cursor-pointer"
+                      style={{ background: paprika, color: paper }}
+                    >
+                      <Camera size={16} /> Tomar / subir foto
+                    </label>
+                  </div>
+                )}
+
+                {punchModal.type === "entrada" && punchModal.metodo === "clave" && (
+                  <div className="mb-4">
+                    <p className="text-xs mb-3" style={{ color: ink + "aa" }}>
+                      Ingresa tu clave de 4 dígitos para registrar la entrada.
+                    </p>
+                    <input
+                      value={punchModal.claveInput}
+                      onChange={(e) =>
+                        setPunchModal((p) => ({ ...p, claveInput: e.target.value.replace(/\D/g, "").slice(0, 4) }))
+                      }
+                      type="password"
+                      inputMode="numeric"
+                      maxLength={4}
+                      placeholder="Clave"
+                      className="w-full px-3 py-3 rounded-sm text-lg tracking-[0.3em] text-center outline-none"
+                      style={{ border: `1px solid ${ink}33`, background: "#fff", color: ink }}
+                    />
+                  </div>
+                )}
+
+                {punchModal.type === "entrada" && punchModal.metodo === "biometrico" && (
+                  <div className="mb-4">
+                    {punchModal.bioStatus === "success" ? (
+                      <div
+                        className="flex items-center justify-center gap-2 py-3 rounded-sm font-bold text-sm"
+                        style={{ background: sage + "22", color: sage }}
+                      >
+                        <Check size={16} /> Verificado
+                      </div>
+                    ) : (
+                      <button
+                        onClick={runBiometricCheck}
+                        disabled={punchModal.bioStatus === "checking"}
+                        className="w-full flex items-center justify-center gap-2 py-3 rounded-sm font-bold text-sm uppercase disabled:opacity-60"
+                        style={{ background: paprika, color: paper }}
+                      >
+                        <Fingerprint size={16} />
+                        {punchModal.bioStatus === "checking" ? "Verificando…" : "Verificar huella/rostro"}
+                      </button>
+                    )}
+                    {punchModal.bioStatus === "error" && (
+                      <p className="text-xs mt-2" style={{ color: paprika }}>
+                        No se pudo verificar. Intenta de nuevo.
+                      </p>
+                    )}
+                  </div>
+                )}
+
+                {punchModal.photo && (
+                  <div className="mb-4">
+                    <img
+                      src={punchModal.photo}
+                      alt="Foto de uniforme"
+                      className="w-full rounded-sm object-cover mb-2"
+                      style={{ maxHeight: 220 }}
+                    />
+                    <label
+                      htmlFor="reloj-photo-input"
+                      className="inline-flex items-center gap-1.5 text-xs font-bold cursor-pointer"
+                      style={{ color: ink + "88" }}
+                    >
+                      <RotateCcw size={13} /> Repetir foto
+                    </label>
+                  </div>
+                )}
+
+                {punchModal.type === "salida" && !punchModal.photo && (
+                  <label
+                    htmlFor="reloj-photo-input"
+                    className="w-full flex items-center justify-center gap-2 py-2.5 mb-3 rounded-sm font-bold text-xs uppercase cursor-pointer"
+                    style={{ border: `1px solid ${ink}33`, color: ink }}
+                  >
+                    <Camera size={14} /> Agregar foto (opcional)
+                  </label>
+                )}
+
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    onClick={() => setPunchModal(null)}
+                    className="py-2.5 rounded-sm font-bold text-sm uppercase"
+                    style={{ border: `1px solid ${ink}33`, color: ink }}
+                  >
+                    Cancelar
+                  </button>
+                  <button
+                    onClick={confirmPunch}
+                    disabled={
+                      punchModal.type === "entrada" &&
+                      ((punchModal.metodo === "foto" && !punchModal.photo) ||
+                        (punchModal.metodo === "clave" && punchModal.claveInput.length !== 4) ||
+                        (punchModal.metodo === "biometrico" && punchModal.bioStatus !== "success"))
+                    }
+                    className="flex items-center justify-center gap-2 py-2.5 rounded-sm font-bold text-sm uppercase disabled:opacity-40"
+                    style={{ background: punchModal.type === "entrada" ? paprika : sage, color: paper }}
+                  >
+                    <Check size={15} />
+                    Confirmar
+                  </button>
+                </div>
+              </>
+            )}
           </div>
         </div>
-      )}
-
-      {/* ---------------- FORK DE SALIDA ---------------- */}
-      {salidaForkModal && (
-        <div className="fixed inset-0 flex items-end sm:items-center justify-center z-50 p-4" style={{ background: "#00000099" }}>
-          <div className="w-full max-w-sm rounded-sm p-5" style={{ background: paper }}>
-            <div className="mb-1 text-xs font-bold uppercase" style={{ color: sage, letterSpacing: "0.06em" }}>
-              Salida registrada
-            </div>
-            <div className="text-lg font-black mb-1" style={{ color: ink }}>
-              {salidaForkModal.employeeName}
-            </div>
-            <p className="text-sm mb-4" style={{ color: ink + "aa" }}>
-              ¿Quieres registrar algo antes de irte? Es opcional.
-            </p>
-            <div className="flex flex-col gap-2.5 mb-3">
-              <button
-                onClick={() => setProduccionModal({ employeeId: salidaForkModal.employeeId, employeeName: salidaForkModal.employeeName })}
-                className="w-full py-3.5 rounded-sm text-left px-4 flex items-center gap-3"
-                style={{ background: brass + "18", border: `1px solid ${brass}55` }}
-              >
-                <div className="rounded-full flex items-center justify-center flex-shrink-0" style={{ width: 38, height: 38, background: brass + "33" }}>
-                  <ChefHat size={18} color={ink} />
-                </div>
-                <div className="flex-1">
-                  <div className="font-bold text-sm" style={{ color: ink }}>Lo que produje hoy</div>
-                  <div className="text-[11px]" style={{ color: ink + "77" }}>Un renglón: qué preparaste o porcionaste</div>
-                </div>
-                <ChevronRight size={16} color={ink} />
-              </button>
-              <button
-                onClick={() => setMercanciaModal({ employeeId: salidaForkModal.employeeId, employeeName: salidaForkModal.employeeName })}
-                className="w-full py-3.5 rounded-sm text-left px-4 flex items-center gap-3"
-                style={{ background: sage + "18", border: `1px solid ${sage}55` }}
-              >
-                <div className="rounded-full flex items-center justify-center flex-shrink-0" style={{ width: 38, height: 38, background: sage + "33" }}>
-                  <PackagePlus size={18} color={ink} />
-                </div>
-                <div className="flex-1">
-                  <div className="font-bold text-sm" style={{ color: ink }}>Mercancía que llegó</div>
-                  <div className="text-[11px]" style={{ color: ink + "77" }}>Se suma directo al inventario de PAR</div>
-                </div>
-                <ChevronRight size={16} color={ink} />
-              </button>
-            </div>
-            <button
-              onClick={() => { setSalidaForkModal(null); setSelectedEmployeeId(null); }}
-              className="w-full py-2.5 text-center text-xs font-bold uppercase"
-              style={{ color: ink + "66" }}
-            >
-              Nada, ya me voy
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* ---------------- ACTIVIDADES DE PRODUCCIÓN ---------------- */}
-      {produccionModal && (
-        <ProduccionModal
-          modal={produccionModal}
-          onCancel={() => { setProduccionModal(null); setSalidaForkModal(null); setSelectedEmployeeId(null); }}
-          onGuardar={guardarProduccion}
-          paper={paper} ink={ink} brass={brass} sage={sage}
-        />
-      )}
-
-      {/* ---------------- MERCANCÍA RECIBIDA ---------------- */}
-      {mercanciaModal && (
-        <MercanciaModal
-          modal={mercanciaModal}
-          onCancel={() => { setMercanciaModal(null); setSalidaForkModal(null); setSelectedEmployeeId(null); }}
-          onGuardar={guardarMercancia}
-          paper={paper} ink={ink} brass={brass} sage={sage} paprika={paprika}
-        />
       )}
 
       {/* ---------------- PIN MODAL ---------------- */}
@@ -2710,6 +5044,200 @@ export default function RelojChecador() {
         </div>
       )}
 
+      {/* ---------------- AREAS MODAL ---------------- */}
+      {areasModal && (
+        <div
+          className="fixed inset-0 flex items-end sm:items-center justify-center z-50 p-4"
+          style={{ background: "#00000099" }}
+        >
+          <div className="w-full max-w-sm rounded-sm p-5" style={{ background: paper }}>
+            <div className="flex items-center justify-between mb-1">
+              <div className="flex items-center gap-2">
+                <MapPin size={16} color={brass} />
+                <div className="text-xs font-bold uppercase" style={{ color: ink, letterSpacing: "0.06em" }}>
+                  Áreas de trabajo
+                </div>
+              </div>
+              <button onClick={() => setAreasModal(null)}>
+                <X size={18} color={ink} />
+              </button>
+            </div>
+            <p className="text-xs mb-4" style={{ color: ink + "88" }}>
+              {employees.find((e) => e.id === areasModal.employeeId)?.name}
+            </p>
+
+            <div className="flex flex-col gap-2 mb-4">
+              {areasList.map((area) => {
+                const checked = areasModal.draft.includes(area);
+                return (
+                  <button
+                    key={area}
+                    onClick={() => toggleAreaInModal(area)}
+                    className="flex items-center gap-2 px-3 py-2 rounded-sm text-left"
+                    style={{
+                      background: checked ? sage + "14" : ink + "06",
+                      border: `1px solid ${checked ? sage + "55" : ink + "11"}`,
+                    }}
+                  >
+                    <span
+                      className="rounded-sm flex-shrink-0"
+                      style={{
+                        width: 16,
+                        height: 16,
+                        border: `2px solid ${checked ? sage : steel}`,
+                        background: checked ? sage : "transparent",
+                      }}
+                    />
+                    <span className="text-xs font-bold" style={{ color: ink }}>
+                      {area}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+
+            <p className="text-[10px] mb-3" style={{ color: ink + "77" }}>
+              Si marcas más de un área, en el Checador se le preguntará en cuál trabaja al registrar su
+              entrada de cada día.
+            </p>
+
+            <button
+              onClick={saveAreas}
+              className="w-full flex items-center justify-center gap-2 py-2.5 rounded-sm font-bold text-sm uppercase"
+              style={{ background: brass, color: ink }}
+            >
+              <Check size={15} /> Guardar áreas
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ---------------- METODO DE CHECADO MODAL ---------------- */}
+      {metodoModal && (
+        <div
+          className="fixed inset-0 flex items-end sm:items-center justify-center z-50 p-4"
+          style={{ background: "#00000099" }}
+        >
+          <div className="w-full max-w-sm rounded-sm p-5" style={{ background: paper }}>
+            <div className="flex items-center justify-between mb-1">
+              <div className="flex items-center gap-2">
+                <Fingerprint size={16} color={brass} />
+                <div className="text-xs font-bold uppercase" style={{ color: ink, letterSpacing: "0.06em" }}>
+                  Método de checado
+                </div>
+              </div>
+              <button onClick={() => setMetodoModal(null)}>
+                <X size={18} color={ink} />
+              </button>
+            </div>
+            <p className="text-xs mb-4" style={{ color: ink + "88" }}>
+              {employees.find((e) => e.id === metodoModal.employeeId)?.name}
+            </p>
+
+            <div className="flex flex-col gap-2 mb-3">
+              {[
+                { id: "foto", label: "Foto con uniforme", desc: "El método actual — toma una foto al registrar entrada." },
+                { id: "clave", label: "Clave de 4 dígitos", desc: "Ingresa su propia clave personal al checar (distinta del PIN de administrador)." },
+                {
+                  id: "biometrico",
+                  label: "Huella o rostro (biométrico)",
+                  desc: isWebAuthnSupported()
+                    ? "Usa el lector de huella o Face ID de este dispositivo."
+                    : "Este dispositivo/navegador no es compatible con esta opción.",
+                  disabled: !isWebAuthnSupported(),
+                },
+              ].map((opt) => {
+                const selected = metodoModal.draft.tipo === opt.id;
+                return (
+                  <button
+                    key={opt.id}
+                    disabled={opt.disabled}
+                    onClick={() => setMetodoModal((m) => ({ ...m, draft: { ...m.draft, tipo: opt.id }, error: "" }))}
+                    className="flex flex-col items-start px-3 py-2.5 rounded-sm text-left disabled:opacity-40"
+                    style={{
+                      background: selected ? sage + "14" : ink + "06",
+                      border: `1px solid ${selected ? sage + "55" : ink + "11"}`,
+                    }}
+                  >
+                    <span className="text-xs font-bold" style={{ color: ink }}>
+                      {opt.label}
+                    </span>
+                    <span className="text-[10px]" style={{ color: ink + "77" }}>
+                      {opt.desc}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+
+            {metodoModal.draft.tipo === "clave" && (
+              <div className="mb-3">
+                <input
+                  value={metodoModal.draft.clave}
+                  onChange={(e) =>
+                    setMetodoModal((m) => ({
+                      ...m,
+                      draft: { ...m.draft, clave: e.target.value.replace(/\D/g, "").slice(0, 4) },
+                      error: "",
+                    }))
+                  }
+                  type="password"
+                  inputMode="numeric"
+                  maxLength={4}
+                  placeholder="Clave de 4 dígitos"
+                  className="w-full px-3 py-2.5 rounded-sm text-lg tracking-[0.3em] text-center outline-none"
+                  style={{ border: `1px solid ${ink}33`, background: "#fff", color: ink }}
+                />
+              </div>
+            )}
+
+            {metodoModal.draft.tipo === "biometrico" && (
+              <div className="mb-3">
+                {metodoModal.draft.bioCredentialId ? (
+                  <div className="flex items-center justify-between px-3 py-2 rounded-sm" style={{ background: sage + "14" }}>
+                    <span className="text-xs font-bold" style={{ color: sage }}>
+                      ✓ Registrado en este dispositivo
+                    </span>
+                    <button
+                      onClick={enrollBiometricForModal}
+                      disabled={metodoModal.enrolling}
+                      className="text-[10px] font-bold uppercase"
+                      style={{ color: ink + "77" }}
+                    >
+                      Volver a registrar
+                    </button>
+                  </div>
+                ) : (
+                  <button
+                    onClick={enrollBiometricForModal}
+                    disabled={metodoModal.enrolling || !isWebAuthnSupported()}
+                    className="w-full flex items-center justify-center gap-2 py-2.5 rounded-sm font-bold text-xs uppercase disabled:opacity-40"
+                    style={{ background: brass, color: ink }}
+                  >
+                    <Fingerprint size={14} />
+                    {metodoModal.enrolling ? "Esperando lector…" : "Registrar huella/rostro en este dispositivo"}
+                  </button>
+                )}
+              </div>
+            )}
+
+            {metodoModal.error && (
+              <p className="text-xs mb-3" style={{ color: paprika }}>
+                {metodoModal.error}
+              </p>
+            )}
+
+            <button
+              onClick={saveMetodo}
+              className="w-full flex items-center justify-center gap-2 py-2.5 rounded-sm font-bold text-sm uppercase"
+              style={{ background: brass, color: ink }}
+            >
+              <Check size={15} /> Guardar método
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* ---------------- TOAST ---------------- */}
       {toast && (
         <div
@@ -2719,265 +5247,6 @@ export default function RelojChecador() {
           {toast.text}
         </div>
       )}
-    </div>
-  );
-}
-
-function AreasDeHoyPanel({ asignaciones, today, paper, ink, steel, brass }) {
-  const hoy = asignaciones.filter((a) => a.fecha === today);
-  if (hoy.length === 0) return null;
-
-  const porArea = {};
-  hoy.forEach((a) => {
-    porArea[a.area] = porArea[a.area] || [];
-    porArea[a.area].push(a.employeeName);
-  });
-
-  return (
-    <div className="rounded-sm p-3" style={{ background: paper }}>
-      <div className="text-[10px] font-bold uppercase mb-2" style={{ color: ink + "88", letterSpacing: "0.08em" }}>
-        Áreas de hoy
-      </div>
-      <div className="flex flex-col gap-1.5">
-        {Object.entries(porArea).map(([area, nombres]) => (
-          <div key={area} className="flex items-center justify-between gap-2 text-xs">
-            <span className="font-bold" style={{ color: ink }}>
-              {area}
-            </span>
-            <span
-              className="text-right"
-              style={{ color: nombres.length > 1 ? brass : ink + "88", fontWeight: nombres.length > 1 ? 700 : 500 }}
-            >
-              {nombres.join(", ")}
-            </span>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-function ProduccionModal({ modal, onCancel, onGuardar, paper, ink, brass, sage }) {
-  const [descripcion, setDescripcion] = useState("");
-  const [guardando, setGuardando] = useState(false);
-
-  async function confirmar() {
-    if (!descripcion.trim()) return;
-    setGuardando(true);
-    await onGuardar(descripcion.trim());
-    setGuardando(false);
-  }
-
-  return (
-    <div className="fixed inset-0 flex items-end sm:items-center justify-center z-50 p-4" style={{ background: "#00000099" }}>
-      <div className="w-full max-w-sm rounded-sm p-5" style={{ background: paper }}>
-        <div className="flex items-center justify-between mb-1">
-          <div className="text-xs font-bold uppercase" style={{ color: sage, letterSpacing: "0.06em" }}>
-            Actividades de producción
-          </div>
-          <button onClick={onCancel}><X size={18} color={ink} /></button>
-        </div>
-        <div className="text-base font-black mb-3" style={{ color: ink }}>
-          {modal.employeeName}
-        </div>
-        <textarea
-          autoFocus
-          value={descripcion}
-          onChange={(e) => setDescripcion(e.target.value)}
-          placeholder="Ej. Preparé 3L de salsa verde, porcioné 5kg de pollo..."
-          rows={4}
-          className="w-full px-3 py-2.5 rounded-sm text-sm outline-none mb-3"
-          style={{ border: `1px solid ${ink}33`, background: "#fff", color: ink }}
-        />
-        <button
-          onClick={confirmar}
-          disabled={!descripcion.trim() || guardando}
-          className="w-full flex items-center justify-center gap-2 py-3 rounded-sm font-bold text-sm uppercase disabled:opacity-40"
-          style={{ background: brass, color: ink }}
-        >
-          {guardando ? <Loader2 size={16} className="animate-spin" /> : <Check size={16} />}
-          Guardar y terminar
-        </button>
-      </div>
-    </div>
-  );
-}
-
-
-function MercanciaModal({ modal, onCancel, onGuardar, paper, ink, brass, sage, paprika }) {
-  const [productos, setProductos] = useState(null);
-  const [query, setQuery] = useState("");
-  const [carrito, setCarrito] = useState([]); // [{parItemId, nombre, unidad, cantidad}]
-  const [editando, setEditando] = useState(null); // producto elegido, esperando cantidad
-  const [cantidadTemp, setCantidadTemp] = useState("");
-  const [guardando, setGuardando] = useState(false);
-
-  useEffect(() => {
-    (async () => {
-      try {
-        const val = await kvGet("par_items_v2", "kv_store");
-        setProductos(val || []);
-      } catch (e) {
-        setProductos([]);
-      }
-    })();
-  }, []);
-
-  const yaEnCarrito = new Set(carrito.map((c) => c.parItemId));
-  const filtrados = (productos || [])
-    .filter((p) => !yaEnCarrito.has(p.id))
-    .filter((p) => query.trim() && p.nombre.toLowerCase().includes(query.trim().toLowerCase()))
-    .slice(0, 8);
-
-  function elegirProducto(p) {
-    setEditando(p);
-    setCantidadTemp("");
-  }
-
-  function confirmarCantidad() {
-    const cant = Number(cantidadTemp);
-    if (!editando || !cant || cant <= 0) return;
-    setCarrito((c) => [...c, { parItemId: editando.id, nombre: editando.nombre, unidad: editando.unidad, cantidad: cant }]);
-    setEditando(null);
-    setCantidadTemp("");
-    setQuery("");
-  }
-
-  function quitarDelCarrito(id) {
-    setCarrito((c) => c.filter((x) => x.parItemId !== id));
-  }
-
-  async function confirmar() {
-    if (carrito.length === 0) return;
-    setGuardando(true);
-    await onGuardar(carrito, modal.employeeName);
-    setGuardando(false);
-  }
-
-  return (
-    <div className="fixed inset-0 flex items-end sm:items-center justify-center z-50 p-4" style={{ background: "#00000099" }}>
-      <div className="w-full max-w-sm rounded-sm p-5" style={{ background: paper, maxHeight: "88vh", overflowY: "auto" }}>
-        <div className="flex items-center justify-between mb-1">
-          <div className="text-xs font-bold uppercase" style={{ color: sage, letterSpacing: "0.06em" }}>
-            Mercancía que entró hoy
-          </div>
-          <button onClick={onCancel}><X size={18} color={ink} /></button>
-        </div>
-        <div className="text-base font-black mb-4" style={{ color: ink }}>
-          {modal.employeeName}
-        </div>
-
-        {/* Paso 1: buscar y elegir un producto */}
-        {!editando && (
-          <>
-            <label className="text-[10px] font-bold uppercase mb-1 block" style={{ color: ink + "88" }}>
-              Busca el producto que llegó
-            </label>
-            <input
-              autoFocus
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              placeholder="Ej. Leche, jitomate, aceite..."
-              className="w-full px-3 py-3 rounded-sm text-base outline-none mb-2"
-              style={{ border: `1px solid ${ink}33`, background: "#fff", color: ink }}
-            />
-            {productos === null ? (
-              <div className="flex items-center gap-2 text-sm py-3" style={{ color: ink + "88" }}>
-                <Loader2 size={16} className="animate-spin" /> Cargando catálogo…
-              </div>
-            ) : query.trim() && filtrados.length === 0 ? (
-              <p className="text-sm py-3 text-center" style={{ color: ink + "66" }}>Sin resultados.</p>
-            ) : (
-              <div className="flex flex-col gap-1.5 mb-2">
-                {filtrados.map((p) => (
-                  <button
-                    key={p.id}
-                    onClick={() => elegirProducto(p)}
-                    className="w-full flex items-center justify-between px-3 py-3 rounded-sm text-left"
-                    style={{ background: "#fff", border: `1px solid ${ink}15` }}
-                  >
-                    <span className="text-sm font-bold" style={{ color: ink }}>{p.nombre}</span>
-                    <span className="text-xs" style={{ color: ink + "77" }}>{p.unidad}</span>
-                  </button>
-                ))}
-              </div>
-            )}
-          </>
-        )}
-
-        {/* Paso 2: capturar cantidad del producto elegido */}
-        {editando && (
-          <div className="rounded-sm p-4 mb-3" style={{ background: brass + "22", border: `1px solid ${brass}` }}>
-            <div className="text-sm font-black mb-2" style={{ color: ink }}>{editando.nombre}</div>
-            <label className="text-[10px] font-bold uppercase mb-1 block" style={{ color: ink + "88" }}>
-              ¿Cuántos {editando.unidad} llegaron?
-            </label>
-            <div className="flex items-center gap-2">
-              <input
-                autoFocus
-                type="number"
-                inputMode="decimal"
-                value={cantidadTemp}
-                onChange={(e) => setCantidadTemp(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && confirmarCantidad()}
-                placeholder="0"
-                className="flex-1 px-3 py-3 rounded-sm text-2xl font-black text-center outline-none"
-                style={{ border: `1px solid ${ink}33`, background: "#fff", color: ink }}
-              />
-              <span className="text-sm font-bold flex-shrink-0" style={{ color: ink + "88" }}>{editando.unidad}</span>
-            </div>
-            <div className="flex gap-2 mt-3">
-              <button
-                onClick={() => setEditando(null)}
-                className="flex-1 py-2.5 rounded-sm font-bold text-xs uppercase"
-                style={{ border: `1px solid ${ink}33`, color: ink }}
-              >
-                Cancelar
-              </button>
-              <button
-                onClick={confirmarCantidad}
-                disabled={!cantidadTemp || Number(cantidadTemp) <= 0}
-                className="flex-1 py-2.5 rounded-sm font-bold text-xs uppercase disabled:opacity-40"
-                style={{ background: brass, color: ink }}
-              >
-                Agregar a la lista
-              </button>
-            </div>
-          </div>
-        )}
-
-        {/* Lista de lo ya agregado */}
-        {carrito.length > 0 && (
-          <div className="mb-4">
-            <div className="text-[10px] font-bold uppercase mb-1.5" style={{ color: ink + "77", letterSpacing: "0.06em" }}>
-              Ya agregaste ({carrito.length})
-            </div>
-            <div className="flex flex-col gap-1.5">
-              {carrito.map((c) => (
-                <div key={c.parItemId} className="flex items-center justify-between px-3 py-2.5 rounded-sm" style={{ background: sage + "18" }}>
-                  <span className="text-sm font-bold" style={{ color: ink }}>{c.nombre}</span>
-                  <div className="flex items-center gap-2">
-                    <span className="text-sm font-black" style={{ color: sage }}>{c.cantidad} {c.unidad}</span>
-                    <button onClick={() => quitarDelCarrito(c.parItemId)}>
-                      <X size={15} color={paprika} />
-                    </button>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
-
-        <button
-          onClick={confirmar}
-          disabled={carrito.length === 0 || guardando || !!editando}
-          className="w-full flex items-center justify-center gap-2 py-3.5 rounded-sm font-bold text-sm uppercase disabled:opacity-40"
-          style={{ background: sage, color: "#fff" }}
-        >
-          {guardando ? <Loader2 size={16} className="animate-spin" /> : <Check size={16} />}
-          {carrito.length === 0 ? "Agrega al menos un producto" : `Registrar ${carrito.length} producto${carrito.length === 1 ? "" : "s"} en PAR`}
-        </button>
-      </div>
     </div>
   );
 }
