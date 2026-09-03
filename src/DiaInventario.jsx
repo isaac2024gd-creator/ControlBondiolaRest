@@ -41,6 +41,54 @@ async function storageSetRetry(key, value, tabla = "kv_store_dia", intentos = 3)
   return { ok: false, error: ultimoError };
 }
 
+/* Igual que kvGet, pero además regresa cuándo se guardó por última vez ese registro
+   (updated_at), para poder detectar si otro dispositivo lo cambió mientras tanto. */
+async function kvGetConVersion(key, tabla = "kv_store_dia") {
+  const { data, error } = await supabase.from(tabla).select("value, updated_at").eq("key", key).maybeSingle();
+  if (error) throw error;
+  return data ? { value: data.value, updatedAt: data.updated_at } : { value: null, updatedAt: null };
+}
+
+/* Guarda solo si nadie más cambió este registro desde que lo leímos (evita que dos
+   dispositivos guardando casi al mismo tiempo se pisen entre sí sin darse cuenta).
+   Si `expectedUpdatedAt` ya no coincide con lo que hay en el servidor, no sobrescribe:
+   regresa { conflicto: true } para que quien llamó decida qué hacer (avisar y traer lo
+   más reciente, en vez de perder en silencio lo que guardó la otra persona). */
+async function kvSetConVersion(key, value, expectedUpdatedAt, tabla = "kv_store_dia") {
+  const fecha = new Date().toISOString();
+  if (expectedUpdatedAt == null) {
+    // Todavía no había nada guardado bajo esta clave (o no se pudo leer su versión):
+    // se guarda directo, no hay con qué comparar.
+    const { error } = await supabase.from(tabla).upsert({ key, value, updated_at: fecha });
+    if (error) throw error;
+    return { ok: true, updatedAt: fecha };
+  }
+  const { data, error } = await supabase
+    .from(tabla)
+    .update({ value, updated_at: fecha })
+    .eq("key", key)
+    .eq("updated_at", expectedUpdatedAt)
+    .select("updated_at");
+  if (error) throw error;
+  if (!data || data.length === 0) return { ok: false, conflicto: true };
+  return { ok: true, updatedAt: fecha };
+}
+
+async function storageSetRetryConVersion(key, value, expectedUpdatedAt, tabla = "kv_store_dia", intentos = 3) {
+  let ultimoError = null;
+  for (let i = 0; i < intentos; i++) {
+    try {
+      const res = await kvSetConVersion(key, value, expectedUpdatedAt, tabla);
+      if (res.ok) return res;
+      return res; // conflicto real (alguien más ya guardó): reintentar con la misma versión esperada no serviría
+    } catch (e) {
+      ultimoError = e;
+    }
+    if (i < intentos - 1) await sleep(500 * (i + 1));
+  }
+  return { ok: false, error: ultimoError };
+}
+
 /* ---------- Tokens (mismos que PAR, para identidad consistente) ---------- */
 const C = {
   bg: "#E8F0EB",
@@ -160,14 +208,21 @@ async function appendHistorial(items, fecha, diaObjetivo) {
     } catch (e) {
       hist = [];
     }
-    hist.push({
+    const diaKey = fecha.split("T")[0]; // YYYY-MM-DD
+    const entrada = {
       fecha,
       items: items.map((i) => ({
         nombre: i.nombre, unidad: i.unidad, categoria: i.categoria,
         area: i.area, nivelMinimo: nivelEfectivo(i, diaObjetivo), stockActual: i.stockActual,
         parKey: i.parKey || null,
       })),
-    });
+    };
+    // Si ya se guardó algo hoy (otra área, u otro guardado del mismo día), se reemplaza
+    // esa entrada con la foto completa más reciente en vez de agregar una nueva — evita
+    // contar el mismo día dos veces en los promedios de consumo.
+    const idxHoy = hist.findIndex((h) => (h.fecha || "").split("T")[0] === diaKey);
+    if (idxHoy >= 0) hist[idxHoy] = entrada;
+    else hist.push(entrada);
     if (hist.length > 45) hist = hist.slice(hist.length - 45);
     await storageSetRetry("dia_historial_v1", hist);
   } catch (e) {
@@ -246,6 +301,8 @@ function DaySelector({ selected, onChange, colorOn = C.accent }) {
 /* ---------- App ---------- */
 export default function DiaInventario() {
   const [items, setItems] = useState(null);
+  const [itemsUpdatedAt, setItemsUpdatedAt] = useState(null);
+  const [loadError, setLoadError] = useState("");
   const [tab, setTab] = useState("conteo");
   const [toast, setToast] = useState("");
   const toastTimer = useRef(null);
@@ -259,25 +316,70 @@ export default function DiaInventario() {
   }
 
   async function load() {
-    try {
-      const val = await kvGet("dia_items_v1");
-      if (val) {
-        setItems(val);
-      } else {
-        setItems(SEED_ITEMS);
-        await kvSet("dia_items_v1", SEED_ITEMS);
+    setLoadError("");
+    let ultimoError = null;
+    for (let i = 0; i < 3; i++) {
+      try {
+        const { value, updatedAt } = await kvGetConVersion("dia_items_v1");
+        if (value) {
+          setItems(value);
+          setItemsUpdatedAt(updatedAt);
+        } else {
+          const fecha = new Date().toISOString();
+          await kvSet("dia_items_v1", SEED_ITEMS);
+          setItems(SEED_ITEMS);
+          setItemsUpdatedAt(fecha);
+        }
+        return;
+      } catch (e) {
+        ultimoError = e;
+        if (i < 2) await sleep(600 * (i + 1));
       }
-    } catch (e) {
-      setItems(SEED_ITEMS);
     }
+    // Tras varios intentos no se pudo traer el inventario real: NO se muestran productos
+    // de ejemplo en su lugar, porque si alguien contara y guardara sobre esos datos de
+    // ejemplo, se sobrescribiría el catálogo real en Supabase. Mejor pedir reintentar.
+    setLoadError(ultimoError?.message || "No se pudo conectar con el servidor.");
   }
 
   async function persist(newItems) {
     setItems(newItems);
-    const res = await storageSetRetry("dia_items_v1", newItems);
-    if (!res.ok) {
-      showToast("No se pudo guardar tras varios intentos: " + (res.error?.message || "error desconocido"));
+    const res = await storageSetRetryConVersion("dia_items_v1", newItems, itemsUpdatedAt);
+    if (res.ok) {
+      setItemsUpdatedAt(res.updatedAt);
+      return res;
     }
+    if (res.conflicto) {
+      // Otro dispositivo guardó algo distinto justo mientras esta pantalla tenía datos
+      // más viejos: en vez de sobrescribirlo en silencio, se avisa y se trae lo más
+      // reciente. Lo que se intentaba guardar aquí NO quedó guardado.
+      showToast("Alguien más acaba de guardar cambios aquí. Se actualizó la información — revisa e intenta de nuevo.");
+      try {
+        const fresh = await kvGetConVersion("dia_items_v1");
+        if (fresh.value) {
+          setItems(fresh.value);
+          setItemsUpdatedAt(fresh.updatedAt);
+        }
+      } catch (e) { /* si tampoco se puede releer, se deja como está y se reintentará en el próximo guardado */ }
+      return res;
+    }
+    showToast("No se pudo guardar tras varios intentos: " + (res.error?.message || "error desconocido"));
+    return res;
+  }
+
+  if (loadError) {
+    return (
+      <div className="w-full h-screen flex flex-col items-center justify-center px-8 text-center" style={{ background: C.bg }}>
+        <AlertTriangle size={32} style={{ color: C.critical, marginBottom: 12 }} />
+        <p style={{ fontWeight: 600, fontSize: 15, marginBottom: 4 }}>No se pudo cargar el inventario</p>
+        <p style={{ fontSize: 13, color: C.inkSoft, marginBottom: 18 }}>
+          Revisa tu conexión a internet e intenta de nuevo. No se muestra información de ejemplo para evitar guardarla por error sobre tu inventario real.
+        </p>
+        <button onClick={load} className="px-5 py-2.5 rounded-xl font-semibold text-sm" style={{ background: C.accent, color: "#fff" }}>
+          Reintentar
+        </button>
+      </div>
+    );
   }
 
   if (!items) {
@@ -434,8 +536,23 @@ function ConteoTab({ items, onSave, showToast }) {
   async function guardar() {
     setGuardando(true);
     const fecha = new Date().toISOString();
-    const updated = items.map((i) => ({ ...i, stockActual: draft[i.id] ?? i.stockActual, ultimaActualizacion: fecha }));
-    onSave(updated);
+    const updated = items.map((i) => {
+      const nuevoStock = draft[i.id] ?? i.stockActual;
+      const cambio = nuevoStock !== i.stockActual;
+      // Solo se marca "última actualización" en lo que de verdad se contó ahora —
+      // antes se pisaba la fecha de TODOS los productos aunque no se hubieran tocado.
+      return cambio ? { ...i, stockActual: nuevoStock, ultimaActualizacion: fecha } : i;
+    });
+    const res = await onSave(updated);
+    if (!res?.ok) {
+      // Antes se mostraba "Conteo de hoy guardado" sin esperar esta confirmación.
+      // Ahora, si el guardado real falló, se avisa y NO se marca como guardado.
+      setGuardando(false);
+      // Si fue un conflicto con otro dispositivo, onSave ya mostró un aviso más claro —
+      // no lo tapamos con este mensaje genérico.
+      if (!res?.conflicto) showToast("No se pudo guardar el conteo: " + (res?.error?.message || "intenta de nuevo"));
+      return;
+    }
     await appendHistorial(updated, fecha, diaManana);
     setGuardando(false);
     setGuardado(true);
@@ -587,21 +704,31 @@ function InventarioTab({ items, onSave, showToast }) {
 
   const filtered = items.filter((i) => i.nombre.toLowerCase().includes(query.trim().toLowerCase()));
 
-  function upsert(item) {
-    if (item.id) {
-      onSave(items.map((i) => (i.id === item.id ? { ...i, ...item } : i)));
-      showToast("Producto actualizado");
-    } else {
-      onSave([...items, { ...item, id: uid() }]);
-      showToast("Producto agregado");
+  async function upsert(item) {
+    const esNuevo = !item.id;
+    const nuevaLista = esNuevo
+      ? [...items, { ...item, id: uid() }]
+      : items.map((i) => (i.id === item.id ? { ...i, ...item } : i));
+    // Antes se mostraba "Producto actualizado/agregado" de inmediato, sin esperar a que
+    // Supabase confirmara. Ahora se espera esa confirmación antes de avisar y cerrar el
+    // formulario, para no perder lo capturado si el guardado falla o hay un conflicto.
+    const res = await onSave(nuevaLista);
+    if (!res?.ok) {
+      if (!res?.conflicto) showToast("No se pudo guardar el producto: " + (res?.error?.message || "intenta de nuevo"));
+      return;
     }
+    showToast(esNuevo ? "Producto agregado" : "Producto actualizado");
     setShowForm(false);
     setEditing(null);
   }
 
-  function remove(id) {
-    onSave(items.filter((i) => i.id !== id));
+  async function remove(id) {
+    const res = await onSave(items.filter((i) => i.id !== id));
     setConfirmDelete(null);
+    if (!res?.ok) {
+      if (!res?.conflicto) showToast("No se pudo eliminar el producto: " + (res?.error?.message || "intenta de nuevo"));
+      return;
+    }
     showToast("Producto eliminado");
   }
 
@@ -734,8 +861,22 @@ function ItemForm({ initial, categorias, areas, subareas, onCancel, onSubmit }) 
   async function handleFoto(e) {
     const file = e.target.files?.[0];
     if (!file) return;
-    setSubiendoFoto(true);
     setError("");
+    // Antes se intentaba leer y procesar cualquier archivo elegido sin revisar primero
+    // qué es ni qué tan pesado es — esto rechaza de una vez lo que claramente no sirve,
+    // antes de gastar tiempo (y memoria del celular) intentando procesarlo.
+    if (!file.type || !file.type.startsWith("image/")) {
+      setError("Ese archivo no es una foto. Elige una imagen (jpg, png, etc.).");
+      e.target.value = "";
+      return;
+    }
+    const MAX_ORIGINAL_BYTES = 15 * 1024 * 1024; // 15 MB: de sobra para una foto de celular
+    if (file.size > MAX_ORIGINAL_BYTES) {
+      setError("Esa foto pesa demasiado (más de 15 MB). Intenta con otra.");
+      e.target.value = "";
+      return;
+    }
+    setSubiendoFoto(true);
     try {
       let dataUrl = await compressImage(file, 260, 0.6);
       if (dataUrl.length > 180000) dataUrl = await compressImage(file, 180, 0.45);
@@ -1311,4 +1452,3 @@ function HistorialTab({ items }) {
     </div>
   );
 }
-
