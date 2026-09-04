@@ -26,6 +26,52 @@ async function kvSet(key, value, tabla = "kv_store") {
   return true;
 }
 
+/* Igual que kvGet, pero además regresa cuándo se guardó por última vez ese registro
+   (updated_at), para poder detectar si otro dispositivo lo cambió mientras tanto. */
+async function kvGetConVersion(key, tabla = "kv_store") {
+  const { data, error } = await supabase.from(tabla).select("value, updated_at").eq("key", key).maybeSingle();
+  if (error) throw error;
+  return data ? { value: data.value, updatedAt: data.updated_at } : { value: null, updatedAt: null };
+}
+
+/* Guarda solo si nadie más cambió este registro desde que lo leímos (evita que dos
+   dispositivos guardando casi al mismo tiempo se pisen entre sí sin darse cuenta).
+   Si `expectedUpdatedAt` ya no coincide con lo que hay en el servidor, no sobrescribe:
+   regresa { conflicto: true } para que quien llamó decida qué hacer (avisar y traer lo
+   más reciente, en vez de perder en silencio lo que guardó la otra persona). */
+async function kvSetConVersion(key, value, expectedUpdatedAt, tabla = "kv_store") {
+  const fecha = new Date().toISOString();
+  if (expectedUpdatedAt == null) {
+    const { error } = await supabase.from(tabla).upsert({ key, value, updated_at: fecha });
+    if (error) throw error;
+    return { ok: true, updatedAt: fecha };
+  }
+  const { data, error } = await supabase
+    .from(tabla)
+    .update({ value, updated_at: fecha })
+    .eq("key", key)
+    .eq("updated_at", expectedUpdatedAt)
+    .select("updated_at");
+  if (error) throw error;
+  if (!data || data.length === 0) return { ok: false, conflicto: true };
+  return { ok: true, updatedAt: fecha };
+}
+
+async function storageSetRetryConVersion(key, value, expectedUpdatedAt, tabla = "kv_store", intentos = 3) {
+  let ultimoError = null;
+  for (let i = 0; i < intentos; i++) {
+    try {
+      const res = await kvSetConVersion(key, value, expectedUpdatedAt, tabla);
+      if (res.ok) return res;
+      return res; // conflicto real (alguien más ya guardó): reintentar con la misma versión esperada no serviría
+    } catch (e) {
+      ultimoError = e;
+    }
+    if (i < intentos - 1) await sleep(500 * (i + 1));
+  }
+  return { ok: false, error: ultimoError };
+}
+
 /* Lee el historial diario de DÍA (misma base de datos, tabla propia) para calcular
    cuánto se ha consumido de cada producto vinculado desde el último conteo real de PAR. */
 async function cargarHistorialDia() {
@@ -249,6 +295,8 @@ function ItemThumb({ foto, size = 40 }) {
 /* ---------- App ---------- */
 export default function Par() {
   const [items, setItems] = useState(null);
+  const [itemsUpdatedAt, setItemsUpdatedAt] = useState(null);
+  const [loadError, setLoadError] = useState("");
   const [tab, setTab] = useState("conteo");
   const [toast, setToast] = useState("");
   const [showRespaldo, setShowRespaldo] = useState(false);
@@ -263,25 +311,71 @@ export default function Par() {
   }
 
   async function load() {
-    try {
-      const val = await kvGet("par_items_v2");
-      if (val) {
-        setItems(val);
-      } else {
-        setItems(SEED_ITEMS);
-        await kvSet("par_items_v2", SEED_ITEMS);
+    setLoadError("");
+    let ultimoError = null;
+    for (let i = 0; i < 3; i++) {
+      try {
+        const { value, updatedAt } = await kvGetConVersion("par_items_v2");
+        if (value) {
+          setItems(value);
+          setItemsUpdatedAt(updatedAt);
+        } else {
+          const fecha = new Date().toISOString();
+          await kvSet("par_items_v2", SEED_ITEMS);
+          setItems(SEED_ITEMS);
+          setItemsUpdatedAt(fecha);
+        }
+        return;
+      } catch (e) {
+        ultimoError = e;
+        if (i < 2) await sleep(600 * (i + 1));
       }
-    } catch (e) {
-      setItems(SEED_ITEMS);
     }
+    // Tras varios intentos no se pudo traer el inventario real: NO se muestran productos
+    // de ejemplo en su lugar, porque si alguien contara y guardara sobre esos datos de
+    // ejemplo, se sobrescribiría el catálogo real en Supabase. Mejor pedir reintentar.
+    setLoadError(ultimoError?.message || "No se pudo conectar con el servidor.");
   }
 
+  /* Guarda con verificación de versión: si otro dispositivo guardó algo distinto mientras
+     esta pantalla tenía datos más viejos, no se sobrescribe en silencio — se avisa y se
+     trae lo más reciente. Regresa { ok, conflicto? } para que quien llama sepa si de verdad
+     quedó guardado antes de mostrar "Guardado" o cerrar una pantalla. */
   async function persist(newItems) {
     setItems(newItems);
-    const res = await storageSetRetry("par_items_v2", newItems);
-    if (!res.ok) {
-      showToast("No se pudo guardar tras varios intentos: " + (res.error?.message || "error desconocido"));
+    const res = await storageSetRetryConVersion("par_items_v2", newItems, itemsUpdatedAt);
+    if (res.ok) {
+      setItemsUpdatedAt(res.updatedAt);
+      return res;
     }
+    if (res.conflicto) {
+      showToast("Alguien más acaba de guardar cambios aquí. Se actualizó la información — revisa e intenta de nuevo.");
+      try {
+        const fresh = await kvGetConVersion("par_items_v2");
+        if (fresh.value) {
+          setItems(fresh.value);
+          setItemsUpdatedAt(fresh.updatedAt);
+        }
+      } catch (e) { /* si tampoco se puede releer, se deja como está y se reintentará en el próximo guardado */ }
+      return res;
+    }
+    showToast("No se pudo guardar tras varios intentos: " + (res.error?.message || "error desconocido"));
+    return res;
+  }
+
+  if (loadError) {
+    return (
+      <div className="w-full h-screen flex flex-col items-center justify-center px-8 text-center" style={{ background: C.bg }}>
+        <AlertTriangle size={32} style={{ color: C.critical, marginBottom: 12 }} />
+        <p style={{ fontWeight: 600, fontSize: 15, marginBottom: 4 }}>No se pudo cargar el inventario</p>
+        <p style={{ fontSize: 13, color: C.inkSoft, marginBottom: 18 }}>
+          Revisa tu conexión a internet e intenta de nuevo. No se muestra información de ejemplo para evitar guardarla por error sobre tu inventario real.
+        </p>
+        <button onClick={load} className="px-5 py-2.5 rounded-xl font-semibold text-sm" style={{ background: C.accent, color: "#fff" }}>
+          Reintentar
+        </button>
+      </div>
+    );
   }
 
   if (!items) {
@@ -316,7 +410,15 @@ export default function Par() {
         <RespaldoModal
           items={items}
           onCerrar={() => setShowRespaldo(false)}
-          onImportar={(nuevos) => { persist(nuevos); showToast("Datos cargados en este dispositivo"); setShowRespaldo(false); }}
+          onImportar={async (nuevos) => {
+            const res = await persist(nuevos);
+            if (res?.ok) {
+              showToast("Inventario reemplazado en todos los dispositivos");
+              setShowRespaldo(false);
+            }
+            // Si falló o hubo conflicto, persist() ya avisó por qué — se deja el modal
+            // abierto para que se pueda reintentar sin volver a pegar el texto.
+          }}
         />
       )}
     </div>
@@ -345,27 +447,56 @@ function Header({ onRespaldo }) {
   );
 }
 
+/* Valida y normaliza lo pegado en "Importar" antes de dejarlo pasar. Antes solo se
+   revisaba que fuera un arreglo de JSON — cualquier arreglo (aunque no tuviera nada que
+   ver con un inventario de PAR) se aceptaba y reemplazaba el inventario compartido de
+   TODOS los dispositivos. Ahora se exige que cada elemento tenga al menos nombre, unidad,
+   par y existencia válidos; lo demás se completa con valores por default. */
+function validarItemsImportados(parsed) {
+  if (!Array.isArray(parsed)) return { ok: false, error: "El texto no es una lista de productos válida." };
+  if (parsed.length === 0) return { ok: false, error: "La lista está vacía — no hay nada que importar." };
+  const items = [];
+  for (let idx = 0; idx < parsed.length; idx++) {
+    const raw = parsed[idx];
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      return { ok: false, error: `El producto #${idx + 1} no tiene el formato esperado.` };
+    }
+    const nombre = typeof raw.nombre === "string" ? raw.nombre.trim() : "";
+    if (!nombre) return { ok: false, error: `El producto #${idx + 1} no tiene nombre.` };
+    const unidad = typeof raw.unidad === "string" ? raw.unidad.trim() : "";
+    if (!unidad) return { ok: false, error: `"${nombre}" no tiene unidad.` };
+    const parLevel = Number(raw.parLevel);
+    if (!Number.isFinite(parLevel) || parLevel < 0) {
+      return { ok: false, error: `"${nombre}" tiene un par (nivel deseado) inválido.` };
+    }
+    const stockActual = Number(raw.stockActual);
+    if (!Number.isFinite(stockActual) || stockActual < 0) {
+      return { ok: false, error: `"${nombre}" tiene una existencia inválida.` };
+    }
+    items.push({
+      id: typeof raw.id === "string" && raw.id ? raw.id : uid(),
+      nombre,
+      unidad,
+      parLevel,
+      stockActual,
+      categoria: typeof raw.categoria === "string" ? raw.categoria : "",
+      proveedor: typeof raw.proveedor === "string" ? raw.proveedor : "",
+      area: typeof raw.area === "string" ? raw.area : "",
+      subarea: typeof raw.subarea === "string" ? raw.subarea : "",
+      foto: typeof raw.foto === "string" ? raw.foto : "",
+      ultimaActualizacion: typeof raw.ultimaActualizacion === "string" ? raw.ultimaActualizacion : undefined,
+    });
+  }
+  return { ok: true, items };
+}
+
 function RespaldoModal({ items, onCerrar, onImportar }) {
   const [modo, setModo] = useState("exportar");
   const [texto, setTexto] = useState("");
   const [copiado, setCopiado] = useState(false);
   const [error, setError] = useState("");
-  const [pruebaExterna, setPruebaExterna] = useState(null); // null | "probando" | "ok" | "fallo"
-
-  async function probarConexionExterna() {
-    setPruebaExterna("probando");
-    try {
-      const res = await fetch("https://jsonplaceholder.typicode.com/todos/1");
-      if (res.ok) {
-        await res.json();
-        setPruebaExterna("ok");
-      } else {
-        setPruebaExterna("fallo");
-      }
-    } catch (e) {
-      setPruebaExterna("fallo");
-    }
-  }
+  const [pendienteImportar, setPendienteImportar] = useState(null); // arreglo validado, esperando confirmación
+  const [importando, setImportando] = useState(false);
 
   const datosActuales = JSON.stringify(items, null, 0);
 
@@ -417,13 +548,29 @@ function RespaldoModal({ items, onCerrar, onImportar }) {
   }
 
   function cargar() {
+    setError("");
+    let parsed;
     try {
-      const parsed = JSON.parse(texto.trim());
-      if (!Array.isArray(parsed)) throw new Error("El texto no es una lista de productos válida.");
-      onImportar(parsed);
+      parsed = JSON.parse(texto.trim());
     } catch (e) {
       setError("El texto pegado no es válido. Revisa que sea exactamente lo que copiaste del otro dispositivo.");
+      return;
     }
+    const validado = validarItemsImportados(parsed);
+    if (!validado.ok) {
+      setError(validado.error);
+      return;
+    }
+    // No se importa de inmediato: esto reemplaza el inventario que ven TODOS los
+    // dispositivos (no solo este teléfono), así que primero se pide confirmar.
+    setPendienteImportar(validado.items);
+  }
+
+  async function confirmarImportar() {
+    setImportando(true);
+    await onImportar(pendienteImportar);
+    setImportando(false);
+    setPendienteImportar(null);
   }
 
   return (
@@ -481,31 +628,6 @@ function RespaldoModal({ items, onCerrar, onImportar }) {
             <p style={{ fontSize: 11, color: C.inkSoft, marginTop: 8 }}>
               Copia esto y mándalo por WhatsApp (o lo que uses) al otro teléfono, para que ahí lo peguen en "Importar".
             </p>
-
-            <div className="mt-4 pt-4" style={{ borderTop: `1px dashed ${C.line}` }}>
-              <p style={{ fontSize: 11.5, color: C.inkSoft, marginBottom: 8 }}>
-                Antes de conectar a un servicio externo (Supabase, etc.), esto revisa si este artefacto puede hablar con servidores externos:
-              </p>
-              <button
-                onClick={probarConexionExterna}
-                disabled={pruebaExterna === "probando"}
-                className="w-full py-2.5 rounded-xl text-sm font-semibold flex items-center justify-center gap-2"
-                style={{ border: `1px solid ${C.line}` }}
-              >
-                {pruebaExterna === "probando" && <Loader2 size={14} className="animate-spin" />}
-                Probar conexión externa
-              </button>
-              {pruebaExterna === "ok" && (
-                <div className="flex items-center gap-2 mt-2 px-3 py-2 rounded-lg" style={{ background: C.okBg, color: C.ok, fontSize: 12.5 }}>
-                  <Check size={14} /> Sí se pudo conectar. Un servicio externo (Supabase, etc.) es viable.
-                </div>
-              )}
-              {pruebaExterna === "fallo" && (
-                <div className="flex items-center gap-2 mt-2 px-3 py-2 rounded-lg" style={{ background: C.criticalBg, color: C.critical, fontSize: 12.5 }}>
-                  <AlertTriangle size={14} /> Bloqueado. Este artefacto no puede llamar servidores externos — Supabase tampoco funcionaría desde aquí.
-                </div>
-              )}
-            </div>
           </>
         ) : (
           <>
@@ -522,12 +644,38 @@ function RespaldoModal({ items, onCerrar, onImportar }) {
               </div>
             )}
             <button onClick={cargar} disabled={!texto.trim()} className="w-full py-2.5 rounded-xl text-sm font-semibold" style={{ background: C.accent, color: "#fff", opacity: texto.trim() ? 1 : 0.5 }}>
-              Cargar estos datos en este dispositivo
+              Revisar e importar
             </button>
             <p style={{ fontSize: 11, color: C.critical, marginTop: 8 }}>
-              Esto reemplaza todo el inventario visible en este teléfono. Si el guardado automático se arregla después, esta importación no se sube sola — vuelve a intentarlo desde Inventario.
+              Esto reemplaza el inventario que ven TODOS los dispositivos, no solo este teléfono — se guarda de inmediato en el servidor compartido. Úsalo solo si estás seguro de que este texto es el más reciente.
             </p>
           </>
+        )}
+
+        {pendienteImportar && (
+          <div className="fixed inset-0 z-[60] flex items-center justify-center px-6" style={{ background: "rgba(34,31,26,0.55)" }} onClick={() => !importando && setPendienteImportar(null)}>
+            <div className="w-full rounded-2xl p-5" style={{ background: C.paper, maxWidth: 340 }} onClick={(e) => e.stopPropagation()}>
+              <div className="flex items-center gap-2 mb-2" style={{ color: C.critical }}>
+                <AlertTriangle size={18} />
+                <span style={{ fontWeight: 700, fontSize: 15 }}>Confirmar reemplazo</span>
+              </div>
+              <p style={{ fontSize: 13.5, marginBottom: 6 }}>
+                Vas a reemplazar el inventario de <strong>{pendienteImportar.length}</strong> producto(s) que ven todos los dispositivos conectados a PAR — no solo este teléfono.
+              </p>
+              <p style={{ fontSize: 12.5, color: C.inkSoft, marginBottom: 16 }}>
+                Lo que haya contado cualquier otro teléfono y no se haya respaldado se perderá. Esta acción no se puede deshacer.
+              </p>
+              <div className="flex gap-2">
+                <button onClick={() => setPendienteImportar(null)} disabled={importando} className="flex-1 py-2.5 rounded-xl text-sm font-medium" style={{ border: `1px solid ${C.line}` }}>
+                  Cancelar
+                </button>
+                <button onClick={confirmarImportar} disabled={importando} className="flex-1 flex items-center justify-center gap-2 py-2.5 rounded-xl text-sm font-semibold" style={{ background: C.critical, color: "#fff", opacity: importando ? 0.7 : 1 }}>
+                  {importando && <Loader2 size={14} className="animate-spin" />}
+                  {importando ? "Reemplazando..." : "Sí, reemplazar para todos"}
+                </button>
+              </div>
+            </div>
+          </div>
         )}
       </div>
     </div>
@@ -668,14 +816,23 @@ function ConteoTab({ items, onSave, showToast }) {
   async function guardar() {
     setGuardando(true);
     const fecha = new Date().toISOString();
-    const updated = items.map((i) => ({
-      ...i,
-      stockActual: draft[i.id] ?? i.stockActual,
-      ultimaActualizacion: fecha,
-    }));
-    onSave(updated);
-    await appendHistorial(updated, fecha);
+    const updated = items.map((i) => {
+      const nuevoStock = draft[i.id] ?? i.stockActual;
+      const cambio = nuevoStock !== i.stockActual;
+      // Solo se marca "última actualización" en lo que de verdad se contó ahora — antes
+      // se pisaba la fecha de TODOS los productos aunque no se hubieran tocado, lo que
+      // además reiniciaba en otras áreas la lista de compras ya marcada como "comprado".
+      return cambio ? { ...i, stockActual: nuevoStock, ultimaActualizacion: fecha } : i;
+    });
+    const res = await onSave(updated);
     setGuardando(false);
+    if (!res?.ok) {
+      // Antes se mostraba "Conteo guardado" sin esperar esta confirmación. Si el guardado
+      // real falló (o hubo conflicto con otro dispositivo), no se marca como guardado.
+      if (!res?.conflicto) showToast("No se pudo guardar el conteo: " + (res?.error?.message || "intenta de nuevo"));
+      return;
+    }
+    await appendHistorial(updated, fecha);
     setGuardado(true);
     showToast("Conteo guardado");
   }
@@ -920,22 +1077,21 @@ function InventarioTab({ items, onSave, showToast }) {
 
   const filtered = items.filter((i) => i.nombre.toLowerCase().includes(query.trim().toLowerCase()));
 
-  function upsert(item) {
-    if (item.id) {
-      onSave(items.map((i) => (i.id === item.id ? { ...i, ...item } : i)));
-      showToast("Producto actualizado");
-    } else {
-      onSave([...items, { ...item, id: uid() }]);
-      showToast("Producto agregado");
-    }
+  async function upsert(item) {
     setShowForm(false);
     setEditing(null);
+    const res = item.id
+      ? await onSave(items.map((i) => (i.id === item.id ? { ...i, ...item } : i)))
+      : await onSave([...items, { ...item, id: uid() }]);
+    // persist() ya avisa si falló o hubo conflicto con otro dispositivo; solo se confirma
+    // el éxito aquí para no decir "actualizado"/"agregado" antes de que de verdad se guarde.
+    if (res?.ok) showToast(item.id ? "Producto actualizado" : "Producto agregado");
   }
 
-  function remove(id) {
-    onSave(items.filter((i) => i.id !== id));
+  async function remove(id) {
     setConfirmDelete(null);
-    showToast("Producto eliminado");
+    const res = await onSave(items.filter((i) => i.id !== id));
+    if (res?.ok) showToast("Producto eliminado");
   }
 
   return (
@@ -1262,7 +1418,8 @@ function ListaTab({ items, onSave, showToast }) {
     guardarChecked({ ...checked, [id]: false });
   }
 
-  function registrarCompra(itemConsolidado, cantidadComprada) {
+  async function registrarCompra(itemConsolidado, cantidadComprada) {
+    setComprando(null);
     const k = itemConsolidado.id;
     const matches = items.filter((i) => itemKeyOf(i) === k);
     const totalFaltante = matches.reduce((s, i) => s + Math.max(0, i.parLevel - i.stockActual), 0);
@@ -1273,9 +1430,9 @@ function ListaTab({ items, onSave, showToast }) {
       const agregar = Math.round(cantidadComprada * proporcion * 10) / 10;
       return { ...i, stockActual: Math.round((i.stockActual + agregar) * 10) / 10 };
     });
-    onSave(actualizados);
+    const res = await onSave(actualizados);
+    if (!res?.ok) return; // persist() ya avisó por qué no se guardó; no se marca como comprado
     guardarChecked({ ...checked, [itemConsolidado.id]: true });
-    setComprando(null);
     showToast(`${itemConsolidado.nombre}: se sumaron ${fmtNum(cantidadComprada)} ${itemConsolidado.unidad} al inventario.`);
   }
 
