@@ -89,12 +89,11 @@ async function storageSetRetryConVersion(key, value, expectedUpdatedAt, tabla = 
   return { ok: false, error: ultimoError };
 }
 
-/* Estado de "terminó su conteo hoy" por área, guardado como
-   { [fecha "YYYY-MM-DD"]: { [area]: { finalizado, finalizadoEn, actualizadoEn } } }.
-   Se guarda una fecha por objeto para que cada día "empiece limpio" solo (no hace falta
-   borrar nada a mano); esta función solo evita que el objeto crezca sin límite guardando
-   como máximo los últimos 14 días. */
-function podarEstadoAreas(estado) {
+/* Poda genérica para cualquier estado guardado como { [fecha "YYYY-MM-DD"]: {...} }
+   (estado de áreas, cierre del día de Pendientes, etc.). Se guarda una fecha por objeto
+   para que cada día "empiece limpio" solo (no hace falta borrar nada a mano); esta función
+   solo evita que el objeto crezca sin límite, guardando como máximo los últimos 14 días. */
+function podarPorFecha(estado) {
   const fechas = Object.keys(estado || {}).sort();
   if (fechas.length <= 14) return estado || {};
   const aQuitar = fechas.slice(0, fechas.length - 14);
@@ -213,6 +212,20 @@ function formatFecha(iso) {
   }
 }
 
+/* Día calendario LOCAL (según el reloj del dispositivo), como "YYYY-MM-DD".
+   OJO: no usar `new Date().toISOString().split("T")[0]` para esto — esa forma da el día en
+   UTC, que en México (UTC-6) ya cambia de fecha desde las 6pm hora local. Eso hacía que el
+   conteo del día, el candado por área y la lista de "Mañana" parecieran reiniciarse solos
+   a media tarde/noche, sin que en realidad hubiera terminado el día del restaurante. Esta
+   función siempre usa el reloj local del dispositivo (año/mes/día tal como los da `Date`
+   sin pasar por ISO/UTC), tanto para "ahora" como para convertir una fecha guardada. */
+function hoyLocalStr(d = new Date()) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
 async function appendHistorial(items, fecha, diaObjetivo) {
   try {
     let hist = [];
@@ -222,7 +235,7 @@ async function appendHistorial(items, fecha, diaObjetivo) {
     } catch (e) {
       hist = [];
     }
-    const diaKey = fecha.split("T")[0]; // YYYY-MM-DD
+    const diaKey = hoyLocalStr(new Date(fecha)); // YYYY-MM-DD, día calendario LOCAL
     const entrada = {
       fecha,
       items: items.map((i) => ({
@@ -234,7 +247,7 @@ async function appendHistorial(items, fecha, diaObjetivo) {
     // Si ya se guardó algo hoy (otra área, u otro guardado del mismo día), se reemplaza
     // esa entrada con la foto completa más reciente en vez de agregar una nueva — evita
     // contar el mismo día dos veces en los promedios de consumo.
-    const idxHoy = hist.findIndex((h) => (h.fecha || "").split("T")[0] === diaKey);
+    const idxHoy = hist.findIndex((h) => h.fecha && hoyLocalStr(new Date(h.fecha)) === diaKey);
     if (idxHoy >= 0) hist[idxHoy] = entrada;
     else hist.push(entrada);
     if (hist.length > 45) hist = hist.slice(hist.length - 45);
@@ -344,10 +357,10 @@ export default function DiaInventario() {
     (async () => {
       try {
         const hist = await kvGet("dia_historial_v1");
-        const hoy = new Date().toISOString().split("T")[0];
+        const hoy = hoyLocalStr();
         const map = {};
         (hist || []).forEach((registro) => {
-          const diaKey = (registro.fecha || "").split("T")[0];
+          const diaKey = registro.fecha ? hoyLocalStr(new Date(registro.fecha)) : "";
           if (!diaKey || diaKey >= hoy) return; // solo días anteriores a hoy
           (registro.items || []).forEach((it) => {
             const key = `${it.nombre.trim().toLowerCase()}|${it.unidad}`;
@@ -363,7 +376,7 @@ export default function DiaInventario() {
   }, []);
 
   async function persistEstadoAreas(nuevoEstado) {
-    const podado = podarEstadoAreas(nuevoEstado);
+    const podado = podarPorFecha(nuevoEstado);
     setEstadoAreas(podado);
     const res = await storageSetRetryConVersion("dia_areas_estado_v1", podado, estadoAreasUpdatedAt);
     if (res.ok) {
@@ -585,7 +598,7 @@ function ConteoTab({ items, onSave, showToast, estadoAreas, onSaveEstadoAreas, h
 
   const diaHoy = new Date().getDay();
   const diaManana = (diaHoy + 1) % 7;
-  const hoyStr = new Date().toISOString().split("T")[0];
+  const hoyStr = hoyLocalStr();
 
   const itemsDelArea = useMemo(() => {
     if (areaActual === "__todas__") return items;
@@ -880,7 +893,7 @@ function roundStep(val, unidad, dir) {
 }
 
 function AreaPicker({ areas, sinArea, onElegir, onCancelar, estadoAreas, hoyStr }) {
-  const hoy = hoyStr || new Date().toISOString().split("T")[0];
+  const hoy = hoyStr || hoyLocalStr();
   return (
     <div className="px-5 pt-8">
       <div className="text-center mb-6">
@@ -1503,22 +1516,67 @@ function ResumenDiscrepancias({ discrepancias }) {
   );
 }
 
+/* Botón/estado de "cerrar el día" cuando no hay nada pendiente que marcar (Pendientes
+   vacío) — mismo control que aparece al final de la lista cuando sí hay pendientes. */
+function ResumenCierreDia({ diaCerrado, cierreHoy, cerrando, reabriendoDia, onCerrar, onReabrir }) {
+  if (diaCerrado) {
+    return (
+      <div className="flex items-center justify-between gap-2 px-4 py-3 mb-4 rounded-xl" style={{ background: C.okBg, border: `1px solid ${C.ok}` }}>
+        <div className="flex items-center gap-2 min-w-0">
+          <Lock size={15} style={{ color: C.ok, flexShrink: 0 }} />
+          <div className="min-w-0">
+            <div style={{ fontSize: 12.5, fontWeight: 600, color: C.ok }}>Día cerrado</div>
+            {cierreHoy?.cerradoEn && (
+              <div style={{ fontSize: 10.5, color: C.inkSoft }}>{formatFecha(cierreHoy.cerradoEn)}</div>
+            )}
+          </div>
+        </div>
+        <button onClick={onReabrir} className="px-3 py-1.5 rounded-lg flex-shrink-0" style={{ background: C.paper, border: `1px solid ${C.ok}`, color: C.ok, fontSize: 12, fontWeight: 600 }}>
+          Reabrir día
+        </button>
+      </div>
+    );
+  }
+  return (
+    <button
+      onClick={onCerrar}
+      disabled={cerrando}
+      className="w-full flex items-center justify-center gap-2 py-3 rounded-xl font-semibold text-sm mb-4"
+      style={{ background: C.accent, color: "#fff", opacity: cerrando ? 0.85 : 1 }}
+    >
+      {cerrando ? <Loader2 size={16} className="animate-spin" /> : <Check size={16} />}
+      {cerrando ? "Cerrando..." : "Cerrar día"}
+    </button>
+  );
+}
+
 function PendientesTab({ items, estadoAreas, historialReciente }) {
   const [checked, setChecked] = useState({});
+  const [cargandoChecked, setCargandoChecked] = useState(true);
+  // Si el día de hoy ya se marcó como "cerrado" desde esta misma pestaña — evita que la
+  // lista se vuelva a marcar sin querer y deja claro que ya se revisó por completo.
+  const [cierreDia, setCierreDia] = useState({});
+  const [cerrando, setCerrando] = useState(false);
+  const [reabriendoDia, setReabriendoDia] = useState(false);
+  const [confirmCerrar, setConfirmCerrar] = useState(false);
+  const [confirmReabrirDia, setConfirmReabrirDia] = useState(false);
   const diaManana = (new Date().getDay() + 1) % 7;
-  const hoyStr = new Date().toISOString().split("T")[0];
+  const hoyStr = hoyLocalStr();
 
   // Qué áreas existen hoy y cuáles ya terminaron su conteo — para el indicador gráfico.
   const areasDelDia = useMemo(() => Array.from(new Set(items.map((i) => i.area).filter(Boolean))), [items]);
   const estadoHoy = estadoAreas?.[hoyStr] || {};
   const areasTerminadas = areasDelDia.filter((a) => estadoHoy[a]?.finalizado).length;
 
+  const cierreHoy = cierreDia?.[hoyStr];
+  const diaCerrado = !!cierreHoy;
+
   // Productos contados hoy cuyo valor se ve como posible error de captura frente al
   // último conteo registrado antes de hoy (mismo criterio que en la pestaña de Conteo).
   const discrepancias = useMemo(() => {
     if (!historialReciente) return [];
     return items
-      .filter((it) => it.ultimaActualizacion && it.ultimaActualizacion.split("T")[0] === hoyStr)
+      .filter((it) => it.ultimaActualizacion && hoyLocalStr(new Date(it.ultimaActualizacion)) === hoyStr)
       .map((it) => {
         const prevInfo = historialReciente[`${it.nombre.trim().toLowerCase()}|${it.unidad}`];
         if (!prevInfo) return null;
@@ -1528,31 +1586,34 @@ function PendientesTab({ items, estadoAreas, historialReciente }) {
       .filter(Boolean);
   }, [items, historialReciente, hoyStr]);
 
-  // Cargar checkeos guardados al montar, pero limpiar si cambió el día
+  // Cargar checkeos guardados al montar, pero limpiar si de verdad cambió el día (calendario
+  // LOCAL, no UTC — antes usaba la fecha en UTC, que en México ya cambia desde las 6pm hora
+  // local, así que la lista parecía "reiniciarse sola" a media tarde/noche aunque siguiera
+  // siendo el mismo día del restaurante).
   useEffect(() => {
     (async () => {
       try {
-        const today = new Date().toISOString().split("T")[0]; // YYYY-MM-DD
         const lastDate = await kvGet("dia_pendientes_checked_lastDate");
-        
-        if (lastDate === today) {
+        if (lastDate === hoyStr) {
           // Mismo día, cargar checkeos previos
           const saved = await kvGet("dia_pendientes_checked_v1");
           if (saved && typeof saved === "object") setChecked(saved);
         } else {
-          // Día nuevo, resetear checkeos y guardar nueva fecha
+          // Día nuevo de verdad, resetear checkeos y guardar nueva fecha
           setChecked({});
-          await kvSet("dia_pendientes_checked_lastDate", today);
+          await kvSet("dia_pendientes_checked_lastDate", hoyStr);
         }
       } catch (e) {
         console.error("Error cargando pendientes guardados:", e);
+      } finally {
+        setCargandoChecked(false);
       }
     })();
   }, []);
 
   // Guardar cambios de checkeos a Supabase
   useEffect(() => {
-    if (Object.keys(checked).length === 0) return;
+    if (cargandoChecked || Object.keys(checked).length === 0) return;
     (async () => {
       try {
         await storageSetRetry("dia_pendientes_checked_v1", checked);
@@ -1560,7 +1621,46 @@ function PendientesTab({ items, estadoAreas, historialReciente }) {
         console.error("Error guardando pendientes:", e);
       }
     })();
-  }, [checked]);
+  }, [checked, cargandoChecked]);
+
+  // Cargar si el día de hoy ya se cerró
+  useEffect(() => {
+    (async () => {
+      try {
+        const val = await kvGet("dia_pendientes_cerrado_v1");
+        setCierreDia(val || {});
+      } catch (e) {
+        setCierreDia({});
+      }
+    })();
+  }, []);
+
+  async function cerrarDia() {
+    setCerrando(true);
+    const nuevo = podarPorFecha({ ...(cierreDia || {}), [hoyStr]: { cerradoEn: new Date().toISOString() } });
+    setCierreDia(nuevo);
+    try {
+      await storageSetRetry("dia_pendientes_cerrado_v1", nuevo);
+    } catch (e) {
+      console.error("Error cerrando el día:", e);
+    }
+    setCerrando(false);
+    setConfirmCerrar(false);
+  }
+
+  async function reabrirDia() {
+    setReabriendoDia(true);
+    const nuevo = { ...(cierreDia || {}) };
+    delete nuevo[hoyStr];
+    setCierreDia(nuevo);
+    try {
+      await storageSetRetry("dia_pendientes_cerrado_v1", nuevo);
+    } catch (e) {
+      console.error("Error reabriendo el día:", e);
+    }
+    setReabriendoDia(false);
+    setConfirmReabrirDia(false);
+  }
 
   const pendientes = useMemo(() => {
     return items
@@ -1596,7 +1696,10 @@ function PendientesTab({ items, estadoAreas, historialReciente }) {
       .sort((a, b) => a.nombre.localeCompare(b.nombre, "es"));
   }, [pendientes]);
 
-  function toggle(id) { setChecked((c) => ({ ...c, [id]: !c[id] })); }
+  function toggle(id) {
+    if (diaCerrado) return;
+    setChecked((c) => ({ ...c, [id]: !c[id] }));
+  }
 
   const fechas = items.map((i) => i.ultimaActualizacion).filter(Boolean).sort();
   const fechaConteo = fechas.length ? fechas[fechas.length - 1] : null;
@@ -1606,11 +1709,37 @@ function PendientesTab({ items, estadoAreas, historialReciente }) {
       <div className="px-5 pt-4">
         <ResumenAreasHoy areasDelDia={areasDelDia} estadoHoy={estadoHoy} areasTerminadas={areasTerminadas} />
         <ResumenDiscrepancias discrepancias={discrepancias} />
+        <ResumenCierreDia
+          diaCerrado={diaCerrado}
+          cierreHoy={cierreHoy}
+          cerrando={cerrando}
+          reabriendoDia={reabriendoDia}
+          onCerrar={() => setConfirmCerrar(true)}
+          onReabrir={() => setConfirmReabrirDia(true)}
+        />
         <div className="pt-10 text-center">
           <Check size={40} style={{ color: C.ok, margin: "0 auto 12px" }} />
           <p style={{ fontWeight: 600, fontSize: 15 }}>Todo listo para mañana</p>
           <p style={{ fontSize: 13, color: C.inkSoft, marginTop: 4 }}>Nada por debajo de su mínimo diario.</p>
         </div>
+        {confirmCerrar && (
+          <ConfirmAccion
+            text="¿Cerrar el día? La lista de Mañana quedará marcada como revisada y no se podrá seguir marcando hasta que la reabras o empiece el día siguiente."
+            confirmLabel="Cerrar día"
+            confirmColor={C.accent}
+            onCancel={() => setConfirmCerrar(false)}
+            onConfirm={cerrarDia}
+          />
+        )}
+        {confirmReabrirDia && (
+          <ConfirmAccion
+            text="¿Reabrir el día? Vas a poder volver a marcar la lista de Mañana."
+            confirmLabel={reabriendoDia ? "Reabriendo..." : "Reabrir día"}
+            confirmColor={C.warn}
+            onCancel={() => setConfirmReabrirDia(false)}
+            onConfirm={reabrirDia}
+          />
+        )}
       </div>
     );
   }
@@ -1619,6 +1748,23 @@ function PendientesTab({ items, estadoAreas, historialReciente }) {
     <div className="px-5 pt-4">
       <ResumenAreasHoy areasDelDia={areasDelDia} estadoHoy={estadoHoy} areasTerminadas={areasTerminadas} />
       <ResumenDiscrepancias discrepancias={discrepancias} />
+
+      {diaCerrado && (
+        <div className="flex items-center justify-between gap-2 px-4 py-3 mb-4 rounded-xl" style={{ background: C.okBg, border: `1px solid ${C.ok}` }}>
+          <div className="flex items-center gap-2 min-w-0">
+            <Lock size={15} style={{ color: C.ok, flexShrink: 0 }} />
+            <div className="min-w-0">
+              <div style={{ fontSize: 12.5, fontWeight: 600, color: C.ok }}>Día cerrado</div>
+              {cierreHoy?.cerradoEn && (
+                <div style={{ fontSize: 10.5, color: C.inkSoft }}>{formatFecha(cierreHoy.cerradoEn)}</div>
+              )}
+            </div>
+          </div>
+          <button onClick={() => setConfirmReabrirDia(true)} className="px-3 py-1.5 rounded-lg flex-shrink-0" style={{ background: C.paper, border: `1px solid ${C.ok}`, color: C.ok, fontSize: 12, fontWeight: 600 }}>
+            Reabrir día
+          </button>
+        </div>
+      )}
 
       <div className="rounded-2xl p-4 mb-4" style={{ background: C.paper, border: `1px dashed ${C.line}` }}>
         <div style={{ fontWeight: 600, fontSize: 13 }}>PENDIENTES PARA MAÑANA</div>
@@ -1663,7 +1809,13 @@ function PendientesTab({ items, estadoAreas, historialReciente }) {
             {lista.map((item, idx) => {
               const isChecked = !!checked[item.id];
               return (
-                <button key={item.id} onClick={() => toggle(item.id)} className="w-full flex items-center gap-3 px-4 py-3 text-left" style={{ borderTop: idx > 0 ? `1px solid ${C.line}` : "none", opacity: isChecked ? 0.5 : 1 }}>
+                <button
+                  key={item.id}
+                  onClick={() => toggle(item.id)}
+                  disabled={diaCerrado}
+                  className="w-full flex items-center gap-3 px-4 py-3 text-left"
+                  style={{ borderTop: idx > 0 ? `1px solid ${C.line}` : "none", opacity: isChecked ? 0.5 : diaCerrado ? 0.7 : 1 }}
+                >
                   <div className="w-5 h-5 rounded-md flex items-center justify-center flex-shrink-0" style={{ border: `1.5px solid ${isChecked ? C.accent : C.line}`, background: isChecked ? C.accent : "transparent" }}>
                     {isChecked && <Check size={13} color="#fff" />}
                   </div>
@@ -1688,6 +1840,42 @@ function PendientesTab({ items, estadoAreas, historialReciente }) {
           </div>
         </div>
       ))}
+
+      {!diaCerrado ? (
+        <button
+          onClick={() => setConfirmCerrar(true)}
+          disabled={cerrando}
+          className="w-full flex items-center justify-center gap-2 py-3 rounded-xl font-semibold text-sm mt-1"
+          style={{ background: C.accent, color: "#fff", opacity: cerrando ? 0.85 : 1 }}
+        >
+          {cerrando ? <Loader2 size={16} className="animate-spin" /> : <Check size={16} />}
+          {cerrando ? "Cerrando..." : "Cerrar día"}
+        </button>
+      ) : (
+        <p className="text-center" style={{ fontSize: 11.5, color: C.inkSoft, marginTop: 4 }}>
+          Día cerrado — no se reiniciará hasta mañana. Usa "Reabrir día" arriba si necesitas corregir algo.
+        </p>
+      )}
+
+      {confirmCerrar && (
+        <ConfirmAccion
+          text="¿Cerrar el día? La lista de Mañana quedará marcada como revisada y no se podrá seguir marcando hasta que la reabras o empiece el día siguiente."
+          confirmLabel="Cerrar día"
+          confirmColor={C.accent}
+          onCancel={() => setConfirmCerrar(false)}
+          onConfirm={cerrarDia}
+        />
+      )}
+
+      {confirmReabrirDia && (
+        <ConfirmAccion
+          text="¿Reabrir el día? Vas a poder volver a marcar la lista de Mañana."
+          confirmLabel={reabriendoDia ? "Reabriendo..." : "Reabrir día"}
+          confirmColor={C.warn}
+          onCancel={() => setConfirmReabrirDia(false)}
+          onConfirm={reabrirDia}
+        />
+      )}
     </div>
   );
 }
@@ -1787,4 +1975,3 @@ function HistorialTab({ items }) {
     </div>
   );
 }
-
