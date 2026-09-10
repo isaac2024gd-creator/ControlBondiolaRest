@@ -3798,30 +3798,31 @@ export default function RelojChecador() {
         <style>{`
           @page { size: letter; margin: 0.5in; }
           @media print { .no-print { display: none !important; } .acta-page { box-shadow: none !important; } }
-          .acta-page * { box-sizing: border-box; }
+          .acta-page, .acta-page * { box-sizing: border-box; }
           .acta-page { font-family: Georgia, 'Times New Roman', serif; }
           .acta-section-title {
             font-family: 'Helvetica Neue', Arial, sans-serif;
-            font-size: 0.64rem; font-weight: 900; text-transform: uppercase; letter-spacing: 0.07em;
-            color: #111; margin-top: 1.15rem; padding-bottom: 0.22rem; border-bottom: 1.5px solid #111;
+            font-size: 0.62rem; font-weight: 900; text-transform: uppercase; letter-spacing: 0.06em;
+            color: #111; margin-top: 0.65rem; padding-bottom: 0.14rem; border-bottom: 1.5px solid #111;
           }
-          .acta-field { font-size: 0.82rem; line-height: 1.65; }
-          .acta-narracion { font-size: 0.82rem; line-height: 1.65; white-space: pre-wrap; margin-top: 0.4rem; }
+          .acta-field { font-size: 0.76rem; line-height: 1.42; }
+          .acta-narracion { font-size: 0.76rem; line-height: 1.42; white-space: pre-wrap; margin-top: 0.25rem; }
           .acta-legend {
-            margin-top: 1.6rem; padding: 0.6rem 0.8rem; border: 1px solid #111; border-radius: 2px;
-            font-family: 'Helvetica Neue', Arial, sans-serif; font-size: 0.66rem; line-height: 1.55;
+            margin-top: 0.7rem; padding: 0.35rem 0.6rem; border: 1px solid #111; border-radius: 2px;
+            font-family: 'Helvetica Neue', Arial, sans-serif; font-size: 0.58rem; line-height: 1.35;
             font-style: italic; color: #222; text-align: center;
           }
-          .acta-firma { flex: 1; min-width: 180px; text-align: center; }
-          .acta-firma-linea { border-top: 1.5px solid #111; padding-top: 4px; font-size: 0.72rem; font-weight: 600; min-height: 1rem; }
+          .acta-firma { flex: 1; min-width: 160px; text-align: center; }
+          .acta-firma-linea { border-top: 1.5px solid #111; padding-top: 3px; font-size: 0.68rem; font-weight: 600; min-height: 0.9rem; }
           .acta-firma-caption {
             font-family: 'Helvetica Neue', Arial, sans-serif;
-            font-size: 0.58rem; color: #666; margin-top: 2px; text-transform: uppercase; letter-spacing: 0.03em;
+            font-size: 0.55rem; color: #666; margin-top: 2px; text-transform: uppercase; letter-spacing: 0.03em;
           }
+          .acta-firma-voz { margin-top: 0.5rem; display: flex; justify-content: center; }
           .acta-footer {
             font-family: 'Helvetica Neue', Arial, sans-serif;
-            text-align: center; margin-top: 2.2rem; padding-top: 0.7rem; border-top: 1px solid #ccc;
-            font-size: 0.52rem; color: #888; text-transform: uppercase; letter-spacing: 0.04em; line-height: 1.7;
+            text-align: center; margin-top: 0.9rem; padding-top: 0.4rem; border-top: 1px solid #ccc;
+            font-size: 0.48rem; color: #888; text-transform: uppercase; letter-spacing: 0.03em; line-height: 1.5;
           }
         `}</style>
 
@@ -3848,11 +3849,10 @@ export default function RelojChecador() {
           className="acta-page"
           style={{
             maxWidth: 680,
-            minHeight: "10in",
             margin: "0 auto",
             background: "#fff",
             color: "#111",
-            padding: "1.4rem 1.6rem 1.5rem",
+            padding: "0.9rem 1.4rem 1rem",
             boxShadow: "0 4px 24px #00000055",
           }}
         >
@@ -3864,24 +3864,24 @@ export default function RelojChecador() {
               alignItems: "flex-start",
               gap: "1rem",
               borderBottom: "2.5px double #111",
-              paddingBottom: "0.7rem",
+              paddingBottom: "0.4rem",
             }}
           >
             <div style={{ textAlign: "left" }}>
-              <div style={{ fontSize: "0.98rem", fontWeight: 900, textTransform: "uppercase", letterSpacing: "0.02em" }}>{bizNombreActa}</div>
-              {businessConfig.direccion && <div style={{ fontSize: "0.66rem", color: "#666", marginTop: "0.1rem" }}>{businessConfig.direccion}</div>}
+              <div style={{ fontSize: "0.92rem", fontWeight: 900, textTransform: "uppercase", letterSpacing: "0.02em" }}>{bizNombreActa}</div>
+              {businessConfig.direccion && <div style={{ fontSize: "0.62rem", color: "#666", marginTop: "0.1rem" }}>{businessConfig.direccion}</div>}
             </div>
-            <div style={{ textAlign: "center", border: "1px solid #111", borderRadius: "3px", padding: "0.3rem 0.7rem", flexShrink: 0 }}>
-              <div style={{ fontSize: "0.55rem", textTransform: "uppercase", color: "#666", letterSpacing: "0.06em" }}>Folio</div>
-              <div style={{ fontSize: "0.85rem", fontWeight: 900 }}>{a.folio}</div>
+            <div style={{ textAlign: "center", border: "1px solid #111", borderRadius: "3px", padding: "0.22rem 0.6rem", flexShrink: 0 }}>
+              <div style={{ fontSize: "0.52rem", textTransform: "uppercase", color: "#666", letterSpacing: "0.06em" }}>Folio</div>
+              <div style={{ fontSize: "0.78rem", fontWeight: 900 }}>{a.folio}</div>
             </div>
           </div>
 
-          <div style={{ textAlign: "center", marginTop: "0.9rem" }}>
+          <div style={{ textAlign: "center", marginTop: "0.5rem" }}>
             <div
               style={{
                 fontFamily: "'Helvetica Neue', Arial, sans-serif",
-                fontSize: "1.1rem",
+                fontSize: "0.98rem",
                 fontWeight: 900,
                 textTransform: "uppercase",
                 letterSpacing: "0.05em",
@@ -3889,7 +3889,7 @@ export default function RelojChecador() {
             >
               Acta Administrativa
             </div>
-            <div style={{ fontFamily: "'Helvetica Neue', Arial, sans-serif", fontSize: "0.7rem", color: "#555", marginTop: "0.2rem" }}>
+            <div style={{ fontFamily: "'Helvetica Neue', Arial, sans-serif", fontSize: "0.66rem", color: "#555", marginTop: "0.15rem" }}>
               {formatFechaLargaEs(a.fecha)}
               {a.hora ? ` · ${a.hora} hrs` : ""} · {a.lugar || bizNombreActa}
             </div>
@@ -3919,28 +3919,36 @@ export default function RelojChecador() {
           <div className="acta-section-title">Uso de la voz del trabajador</div>
           {a.usoVoz === "no_de_acuerdo" ? (
             <>
-              <div className="acta-field" style={{ marginTop: "0.3rem" }}>
+              <div className="acta-field" style={{ marginTop: "0.25rem" }}>
                 El trabajador no está conforme y hace uso de la voz. A continuación se describe lo manifestado
                 por el trabajador respecto de su inconformidad:
               </div>
               <div className="acta-narracion">{a.usoVozMotivo}</div>
             </>
           ) : (
-            <div className="acta-field" style={{ marginTop: "0.3rem" }}>
+            <div className="acta-field" style={{ marginTop: "0.25rem" }}>
               El trabajador hizo uso de la voz y manifestó estar de acuerdo con el contenido de la presente acta.
             </div>
           )}
+          <div className="acta-firma-voz">
+            <div className="acta-firma" style={{ flex: "0 1 240px" }}>
+              <div className="acta-firma-linea">{a.employeeNombreCompleto || a.employeeName}</div>
+              <div className="acta-firma-caption">
+                {a.usoVoz === "no_de_acuerdo" ? "Firma — uso de la voz (inconformidad manifestada)" : "Firma — uso de la voz (de acuerdo)"}
+              </div>
+            </div>
+          </div>
 
           {(a.testigo1 || a.testigo2) && (
             <>
               <div className="acta-section-title">Testigos</div>
-              <div className="acta-field" style={{ marginTop: "0.3rem" }}>
+              <div className="acta-field" style={{ marginTop: "0.25rem" }}>
                 {[a.testigo1, a.testigo2].filter(Boolean).join(" · ")}
               </div>
             </>
           )}
 
-          <p className="acta-field" style={{ marginTop: "1.3rem", color: "#333" }}>
+          <p className="acta-field" style={{ marginTop: "0.7rem", color: "#333" }}>
             El trabajador firma de enterado del contenido de la presente acta. Se levanta la presente para
             dejar constancia y ser integrada a su expediente.
           </p>
@@ -3950,7 +3958,7 @@ export default function RelojChecador() {
             fue impreso y se firma el día y hora en que se actúa.
           </div>
 
-          <div style={{ marginTop: "2.2rem", display: "flex", justifyContent: "space-between", gap: "1.5rem", flexWrap: "wrap" }}>
+          <div style={{ marginTop: "0.9rem", display: "flex", justifyContent: "space-between", gap: "1.2rem", flexWrap: "wrap" }}>
             <div className="acta-firma">
               <div className="acta-firma-linea">{a.elaboroNombre}</div>
               <div className="acta-firma-caption">Elaboró</div>
@@ -3961,17 +3969,8 @@ export default function RelojChecador() {
             </div>
           </div>
 
-          <div style={{ marginTop: "1.8rem", display: "flex", justifyContent: "center" }}>
-            <div className="acta-firma" style={{ flex: "0 1 260px" }}>
-              <div className="acta-firma-linea">{a.employeeNombreCompleto || a.employeeName}</div>
-              <div className="acta-firma-caption">
-                {a.usoVoz === "no_de_acuerdo" ? "Firma — uso de la voz (inconformidad manifestada)" : "Firma — uso de la voz (de acuerdo)"}
-              </div>
-            </div>
-          </div>
-
           {(a.testigo1 || a.testigo2) && (
-            <div style={{ marginTop: "1.8rem", display: "flex", justifyContent: "space-between", gap: "1.5rem", flexWrap: "wrap" }}>
+            <div style={{ marginTop: "0.9rem", display: "flex", justifyContent: "space-between", gap: "1.2rem", flexWrap: "wrap" }}>
               {a.testigo1 && (
                 <div className="acta-firma">
                   <div className="acta-firma-linea">{a.testigo1}</div>
@@ -3989,7 +3988,7 @@ export default function RelojChecador() {
 
           <div className="acta-footer">
             <div>Formato de uso interno · Generado por Reloj Checador · {bizNombreActa}</div>
-            <div style={{ marginTop: "0.15rem" }}>
+            <div style={{ marginTop: "0.12rem" }}>
               Este documento es un registro interno de la empresa y requiere revisión de un profesional
               (legal/laboral) antes de su uso formal.
             </div>
