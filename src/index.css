@@ -1,0 +1,17 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+}
+
+/* Oculta elementos marcados como "no-print" (p.ej. el botón flotante de Menú principal
+   de App.jsx) en cualquier vista de impresión de la app, sin importar qué módulo o
+   pantalla la definió. */
+@media print {
+  .no-print {
+    display: none !important;
+  }
+}
