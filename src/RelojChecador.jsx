@@ -87,6 +87,23 @@ function localDateKey(d = new Date()) {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
 
+function localTimeKey(d = new Date()) {
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+// Formatea "YYYY-MM-DD" (string, sin objeto Date) a texto largo en español,
+// evitando el corrimiento de un día que causa parsear con `new Date(...)` por zona horaria.
+function formatFechaLargaEs(fechaStr) {
+  if (!fechaStr) return "";
+  const [y, m, d] = fechaStr.split("-").map(Number);
+  if (!y || !m || !d) return fechaStr;
+  const meses = [
+    "enero", "febrero", "marzo", "abril", "mayo", "junio",
+    "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre",
+  ];
+  return `${d} de ${meses[m - 1]} de ${y}`;
+}
+
 function formatTime(iso) {
   const d = new Date(iso);
   return d.toLocaleTimeString("es-MX", { hour: "2-digit", minute: "2-digit" });
@@ -680,12 +697,27 @@ const TIPOS_INFRACCION_ACTA = [
   "Incumplimiento de normas de higiene o uso de uniforme",
   "Falta de respeto o actitud inapropiada",
   "Incumplimiento de procedimientos de trabajo",
+  "Negligencia en el desempeño de sus funciones",
   "Daño a equipo, herramienta o mobiliario",
   "Manejo inadecuado de dinero, inventario o propinas",
   "Otro",
 ];
 
 const MEDIDAS_DISCIPLINARIAS_ACTA = ["Amonestación verbal", "Amonestación escrita (esta acta)", "Suspensión sin goce de sueldo", "Otra"];
+
+// Textos sugeridos: al elegir uno de estos tipos de infracción, se propone un texto
+// preestablecido para la descripción de los hechos (el usuario lo puede editar libremente
+// antes de guardar el acta; solo se inserta automáticamente si el campo está vacío).
+const TEXTOS_PREESTABLECIDOS_ACTA = {
+  "Ausentismo injustificado":
+    "El colaborador faltó a su turno de trabajo programado sin presentar previamente una justificación válida ni dar aviso oportuno a su superior inmediato, incumpliendo con ello sus obligaciones de asistencia establecidas por la empresa.",
+  "Impuntualidad reiterada":
+    "El colaborador se presentó a laborar después de la hora de entrada establecida para su turno, incurriendo en un retardo que se suma a incidencias previas de la misma naturaleza, lo cual afecta la operación normal del establecimiento.",
+  "Daño a equipo, herramienta o mobiliario":
+    "El colaborador ocasionó daños al mobiliario, equipo, herramienta o instalaciones del establecimiento derivados de un manejo inadecuado o de la falta de cuidado en el desempeño de sus funciones, generando un perjuicio material a la empresa.",
+  "Negligencia en el desempeño de sus funciones":
+    "El colaborador incurrió en negligencia en el desempeño de sus funciones, al no observar el cuidado, la diligencia o los procedimientos que su puesto exige, poniendo en riesgo la operación, el servicio o los bienes del establecimiento.",
+};
 
 const POLL_MS = 45000;
 
@@ -2200,12 +2232,15 @@ export default function RelojChecador() {
     setActaForm({
       employeeId: employeeId || "",
       fecha: localDateKey(),
+      hora: localTimeKey(),
       lugar: businessConfig?.direccion || businessConfig?.nombre || "",
       tipo: "",
       tipoOtro: "",
       narracion: "",
       medida: "",
       suspensionDias: "",
+      usoVoz: "",
+      usoVozMotivo: "",
       testigo1: "",
       testigo2: "",
       elaboroNombre: "",
@@ -2229,6 +2264,15 @@ export default function RelojChecador() {
     if (f.medida === "Suspensión sin goce de sueldo" && !(Number(f.suspensionDias) > 0)) {
       return setActaForm((s) => ({ ...s, error: "Indica cuántos días de suspensión." }));
     }
+    if (!f.usoVoz) {
+      return setActaForm((s) => ({ ...s, error: "Indica si el trabajador está de acuerdo o no en el apartado de uso de la voz." }));
+    }
+    if (f.usoVoz === "no_de_acuerdo" && (!f.usoVozMotivo || f.usoVozMotivo.trim().length < 10)) {
+      return setActaForm((s) => ({
+        ...s,
+        error: "Describe qué manifestó el trabajador respecto de su inconformidad (uso de la voz).",
+      }));
+    }
     if (!f.elaboroNombre.trim()) return setActaForm((s) => ({ ...s, error: "Indica quién elabora el acta." }));
 
     setActaForm((s) => ({ ...s, error: "", guardando: true }));
@@ -2241,11 +2285,14 @@ export default function RelojChecador() {
       employeeNombreCompleto: emp.nombreCompleto || "",
       puesto: emp.puesto || "",
       fecha: f.fecha,
+      hora: f.hora || "",
       lugar: f.lugar.trim(),
       tipo: tipoFinal,
       narracion: f.narracion.trim(),
       medida: f.medida,
       suspensionDias: f.medida === "Suspensión sin goce de sueldo" ? Number(f.suspensionDias) : null,
+      usoVoz: f.usoVoz,
+      usoVozMotivo: f.usoVoz === "no_de_acuerdo" ? f.usoVozMotivo.trim() : "",
       testigo1: f.testigo1.trim(),
       testigo2: f.testigo2.trim(),
       elaboroNombre: f.elaboroNombre.trim(),
@@ -3497,12 +3544,30 @@ export default function RelojChecador() {
           @page { size: letter; margin: 0.5in; }
           @media print { .no-print { display: none !important; } .acta-page { box-shadow: none !important; } }
           .acta-page * { box-sizing: border-box; }
+          .acta-page { font-family: Georgia, 'Times New Roman', serif; }
           .acta-section-title {
-            font-size: 0.66rem; font-weight: 900; text-transform: uppercase; letter-spacing: 0.06em;
-            color: #111; margin-top: 1rem; padding-bottom: 0.2rem; border-bottom: 1.5px solid #111;
+            font-family: 'Helvetica Neue', Arial, sans-serif;
+            font-size: 0.64rem; font-weight: 900; text-transform: uppercase; letter-spacing: 0.07em;
+            color: #111; margin-top: 1.15rem; padding-bottom: 0.22rem; border-bottom: 1.5px solid #111;
           }
-          .acta-field { font-size: 0.8rem; line-height: 1.6; }
-          .acta-narracion { font-size: 0.8rem; line-height: 1.6; white-space: pre-wrap; margin-top: 0.4rem; }
+          .acta-field { font-size: 0.82rem; line-height: 1.65; }
+          .acta-narracion { font-size: 0.82rem; line-height: 1.65; white-space: pre-wrap; margin-top: 0.4rem; }
+          .acta-legend {
+            margin-top: 1.6rem; padding: 0.6rem 0.8rem; border: 1px solid #111; border-radius: 2px;
+            font-family: 'Helvetica Neue', Arial, sans-serif; font-size: 0.66rem; line-height: 1.55;
+            font-style: italic; color: #222; text-align: center;
+          }
+          .acta-firma { flex: 1; min-width: 180px; text-align: center; }
+          .acta-firma-linea { border-top: 1.5px solid #111; padding-top: 4px; font-size: 0.72rem; font-weight: 600; min-height: 1rem; }
+          .acta-firma-caption {
+            font-family: 'Helvetica Neue', Arial, sans-serif;
+            font-size: 0.58rem; color: #666; margin-top: 2px; text-transform: uppercase; letter-spacing: 0.03em;
+          }
+          .acta-footer {
+            font-family: 'Helvetica Neue', Arial, sans-serif;
+            text-align: center; margin-top: 2.2rem; padding-top: 0.7rem; border-top: 1px solid #ccc;
+            font-size: 0.52rem; color: #888; text-transform: uppercase; letter-spacing: 0.04em; line-height: 1.7;
+          }
         `}</style>
 
         <div
@@ -3536,14 +3601,42 @@ export default function RelojChecador() {
             boxShadow: "0 4px 24px #00000055",
           }}
         >
-          <div style={{ textAlign: "center", borderBottom: "2px solid #111", paddingBottom: "0.6rem" }}>
-            <div style={{ fontSize: "0.95rem", fontWeight: 900, textTransform: "uppercase" }}>{bizNombreActa}</div>
-            {businessConfig.direccion && <div style={{ fontSize: "0.68rem", color: "#666" }}>{businessConfig.direccion}</div>}
-            <div style={{ fontSize: "1.1rem", fontWeight: 900, textTransform: "uppercase", marginTop: "0.6rem", letterSpacing: "0.04em" }}>
+          <div
+            style={{
+              fontFamily: "'Helvetica Neue', Arial, sans-serif",
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "flex-start",
+              gap: "1rem",
+              borderBottom: "2.5px double #111",
+              paddingBottom: "0.7rem",
+            }}
+          >
+            <div style={{ textAlign: "left" }}>
+              <div style={{ fontSize: "0.98rem", fontWeight: 900, textTransform: "uppercase", letterSpacing: "0.02em" }}>{bizNombreActa}</div>
+              {businessConfig.direccion && <div style={{ fontSize: "0.66rem", color: "#666", marginTop: "0.1rem" }}>{businessConfig.direccion}</div>}
+            </div>
+            <div style={{ textAlign: "center", border: "1px solid #111", borderRadius: "3px", padding: "0.3rem 0.7rem", flexShrink: 0 }}>
+              <div style={{ fontSize: "0.55rem", textTransform: "uppercase", color: "#666", letterSpacing: "0.06em" }}>Folio</div>
+              <div style={{ fontSize: "0.85rem", fontWeight: 900 }}>{a.folio}</div>
+            </div>
+          </div>
+
+          <div style={{ textAlign: "center", marginTop: "0.9rem" }}>
+            <div
+              style={{
+                fontFamily: "'Helvetica Neue', Arial, sans-serif",
+                fontSize: "1.1rem",
+                fontWeight: 900,
+                textTransform: "uppercase",
+                letterSpacing: "0.05em",
+              }}
+            >
               Acta Administrativa
             </div>
-            <div style={{ fontSize: "0.7rem", color: "#666", marginTop: "0.15rem" }}>
-              Folio {a.folio} · {a.fecha} · {a.lugar || bizNombreActa}
+            <div style={{ fontFamily: "'Helvetica Neue', Arial, sans-serif", fontSize: "0.7rem", color: "#555", marginTop: "0.2rem" }}>
+              {formatFechaLargaEs(a.fecha)}
+              {a.hora ? ` · ${a.hora} hrs` : ""} · {a.lugar || bizNombreActa}
             </div>
           </div>
 
@@ -3568,6 +3661,21 @@ export default function RelojChecador() {
             {a.medida === "Suspensión sin goce de sueldo" && a.suspensionDias ? ` — ${a.suspensionDias} día(s)` : ""}
           </div>
 
+          <div className="acta-section-title">Uso de la voz del trabajador</div>
+          {a.usoVoz === "no_de_acuerdo" ? (
+            <>
+              <div className="acta-field" style={{ marginTop: "0.3rem" }}>
+                El trabajador no está conforme y hace uso de la voz. A continuación se describe lo manifestado
+                por el trabajador respecto de su inconformidad:
+              </div>
+              <div className="acta-narracion">{a.usoVozMotivo}</div>
+            </>
+          ) : (
+            <div className="acta-field" style={{ marginTop: "0.3rem" }}>
+              El trabajador hizo uso de la voz y manifestó estar de acuerdo con el contenido de la presente acta.
+            </div>
+          )}
+
           {(a.testigo1 || a.testigo2) && (
             <>
               <div className="acta-section-title">Testigos</div>
@@ -3577,25 +3685,32 @@ export default function RelojChecador() {
             </>
           )}
 
-          <p style={{ marginTop: "1.3rem", fontSize: "0.72rem", lineHeight: 1.5, color: "#333" }}>
-            El trabajador firma de enterado del contenido de la presente acta, sin que ello implique
-            necesariamente su conformidad con los hechos aquí narrados. Se levanta la presente para
-            dejar constancia y ser integrada al expediente del trabajador.
+          <p className="acta-field" style={{ marginTop: "1.3rem", color: "#333" }}>
+            El trabajador firma de enterado del contenido de la presente acta. Se levanta la presente para
+            dejar constancia y ser integrada a su expediente.
           </p>
 
+          <div className="acta-legend">
+            Requisito de validez: leído que fue el presente documento por todas y cada una de las partes en él,
+            fue impreso y se firma el día y hora en que se actúa.
+          </div>
+
           <div style={{ marginTop: "2.2rem", display: "flex", justifyContent: "space-between", gap: "1.5rem", flexWrap: "wrap" }}>
-            <div style={{ flex: 1, minWidth: 180, textAlign: "center" }}>
-              <div style={{ borderTop: "1.5px solid #111", paddingTop: "4px", fontSize: "0.7rem", fontWeight: 600 }}>
-                {a.elaboroNombre}
-              </div>
-              <div style={{ fontSize: "0.58rem", color: "#666", marginTop: "2px", textTransform: "uppercase" }}>Elaboró</div>
+            <div className="acta-firma">
+              <div className="acta-firma-linea">{a.elaboroNombre}</div>
+              <div className="acta-firma-caption">Elaboró</div>
             </div>
-            <div style={{ flex: 1, minWidth: 180, textAlign: "center" }}>
-              <div style={{ borderTop: "1.5px solid #111", paddingTop: "4px", fontSize: "0.7rem", fontWeight: 600 }}>
-                {a.employeeNombreCompleto || a.employeeName}
-              </div>
-              <div style={{ fontSize: "0.58rem", color: "#666", marginTop: "2px", textTransform: "uppercase" }}>
-                Firma del trabajador (enterado)
+            <div className="acta-firma">
+              <div className="acta-firma-linea">{a.employeeNombreCompleto || a.employeeName}</div>
+              <div className="acta-firma-caption">Firma del trabajador (enterado)</div>
+            </div>
+          </div>
+
+          <div style={{ marginTop: "1.8rem", display: "flex", justifyContent: "center" }}>
+            <div className="acta-firma" style={{ flex: "0 1 260px" }}>
+              <div className="acta-firma-linea">{a.employeeNombreCompleto || a.employeeName}</div>
+              <div className="acta-firma-caption">
+                {a.usoVoz === "no_de_acuerdo" ? "Firma — uso de la voz (inconformidad manifestada)" : "Firma — uso de la voz (de acuerdo)"}
               </div>
             </div>
           </div>
@@ -3603,22 +3718,26 @@ export default function RelojChecador() {
           {(a.testigo1 || a.testigo2) && (
             <div style={{ marginTop: "1.8rem", display: "flex", justifyContent: "space-between", gap: "1.5rem", flexWrap: "wrap" }}>
               {a.testigo1 && (
-                <div style={{ flex: 1, minWidth: 180, textAlign: "center" }}>
-                  <div style={{ borderTop: "1.5px solid #111", paddingTop: "4px", fontSize: "0.7rem", fontWeight: 600 }}>{a.testigo1}</div>
-                  <div style={{ fontSize: "0.58rem", color: "#666", marginTop: "2px", textTransform: "uppercase" }}>Testigo</div>
+                <div className="acta-firma">
+                  <div className="acta-firma-linea">{a.testigo1}</div>
+                  <div className="acta-firma-caption">Testigo</div>
                 </div>
               )}
               {a.testigo2 && (
-                <div style={{ flex: 1, minWidth: 180, textAlign: "center" }}>
-                  <div style={{ borderTop: "1.5px solid #111", paddingTop: "4px", fontSize: "0.7rem", fontWeight: 600 }}>{a.testigo2}</div>
-                  <div style={{ fontSize: "0.58rem", color: "#666", marginTop: "2px", textTransform: "uppercase" }}>Testigo</div>
+                <div className="acta-firma">
+                  <div className="acta-firma-linea">{a.testigo2}</div>
+                  <div className="acta-firma-caption">Testigo</div>
                 </div>
               )}
             </div>
           )}
 
-          <div style={{ textAlign: "center", marginTop: "2rem", fontSize: "0.52rem", color: "#888", textTransform: "uppercase", letterSpacing: "0.05em" }}>
-            Formato de uso interno · Generado por Reloj Checador · {bizNombreActa}
+          <div className="acta-footer">
+            <div>Formato de uso interno · Generado por Reloj Checador · {bizNombreActa}</div>
+            <div style={{ marginTop: "0.15rem" }}>
+              Este documento es un registro interno de la empresa y requiere revisión de un profesional
+              (legal/laboral) antes de su uso formal.
+            </div>
           </div>
         </div>
       </div>
@@ -5103,12 +5222,12 @@ export default function RelojChecador() {
                 </div>
                 <div className="flex-1">
                   <div className="text-[10px] font-bold uppercase mb-1" style={{ color: steel }}>
-                    Lugar
+                    Hora de los hechos
                   </div>
                   <input
-                    value={actaForm.lugar}
-                    onChange={(e) => setActaForm((s) => ({ ...s, lugar: e.target.value }))}
-                    placeholder="Lugar de los hechos"
+                    type="time"
+                    value={actaForm.hora}
+                    onChange={(e) => setActaForm((s) => ({ ...s, hora: e.target.value }))}
                     className="w-full px-2 py-1.5 rounded-sm text-xs outline-none"
                     style={{ border: `1px solid ${ink}33`, background: "#fff", color: ink }}
                   />
@@ -5117,11 +5236,33 @@ export default function RelojChecador() {
 
               <div>
                 <div className="text-[10px] font-bold uppercase mb-1" style={{ color: steel }}>
+                  Lugar
+                </div>
+                <input
+                  value={actaForm.lugar}
+                  onChange={(e) => setActaForm((s) => ({ ...s, lugar: e.target.value }))}
+                  placeholder="Lugar de los hechos"
+                  className="w-full px-2 py-1.5 rounded-sm text-xs outline-none"
+                  style={{ border: `1px solid ${ink}33`, background: "#fff", color: ink }}
+                />
+              </div>
+
+              <div>
+                <div className="text-[10px] font-bold uppercase mb-1" style={{ color: steel }}>
                   Tipo de infracción
                 </div>
                 <select
                   value={actaForm.tipo}
-                  onChange={(e) => setActaForm((s) => ({ ...s, tipo: e.target.value }))}
+                  onChange={(e) => {
+                    const nuevoTipo = e.target.value;
+                    const sugerido = TEXTOS_PREESTABLECIDOS_ACTA[nuevoTipo];
+                    setActaForm((s) => ({
+                      ...s,
+                      tipo: nuevoTipo,
+                      // Solo se autocompleta si el campo sigue vacío, para no pisar texto que Isaac ya escribió.
+                      narracion: sugerido && !s.narracion.trim() ? sugerido : s.narracion,
+                    }));
+                  }}
                   className="w-full px-2 py-1.5 rounded-sm text-xs outline-none"
                   style={{ border: `1px solid ${ink}33`, background: "#fff", color: ink }}
                 >
@@ -5144,8 +5285,20 @@ export default function RelojChecador() {
               </div>
 
               <div>
-                <div className="text-[10px] font-bold uppercase mb-1" style={{ color: steel }}>
-                  Descripción de los hechos
+                <div className="flex items-center justify-between mb-1">
+                  <div className="text-[10px] font-bold uppercase" style={{ color: steel }}>
+                    Descripción de los hechos
+                  </div>
+                  {TEXTOS_PREESTABLECIDOS_ACTA[actaForm.tipo] && (
+                    <button
+                      type="button"
+                      onClick={() => setActaForm((s) => ({ ...s, narracion: TEXTOS_PREESTABLECIDOS_ACTA[s.tipo] || s.narracion }))}
+                      className="text-[9px] font-bold uppercase"
+                      style={{ color: sage }}
+                    >
+                      Usar texto sugerido
+                    </button>
+                  )}
                 </div>
                 <textarea
                   value={actaForm.narracion}
@@ -5155,6 +5308,11 @@ export default function RelojChecador() {
                   className="w-full px-2 py-1.5 rounded-sm text-xs outline-none"
                   style={{ border: `1px solid ${ink}33`, background: "#fff", color: ink, resize: "vertical" }}
                 />
+                {TEXTOS_PREESTABLECIDOS_ACTA[actaForm.tipo] && (
+                  <div className="text-[10px] mt-1" style={{ color: steel }}>
+                    Se sugirió un texto para este tipo de infracción — puedes editarlo libremente antes de guardar.
+                  </div>
+                )}
               </div>
 
               <div>
@@ -5212,6 +5370,60 @@ export default function RelojChecador() {
                     style={{ border: `1px solid ${ink}33`, background: "#fff", color: ink }}
                   />
                 </div>
+              </div>
+
+              <div>
+                <div className="text-[10px] font-bold uppercase mb-1" style={{ color: steel }}>
+                  Uso de la voz del trabajador
+                </div>
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setActaForm((s) => ({ ...s, usoVoz: "de_acuerdo", usoVozMotivo: "" }))}
+                    className="flex-1 text-xs font-bold uppercase px-3 py-2 rounded-sm"
+                    style={
+                      actaForm.usoVoz === "de_acuerdo"
+                        ? { background: sage, color: paper }
+                        : { border: `1px solid ${ink}33`, color: ink, background: "#fff" }
+                    }
+                  >
+                    Estoy de acuerdo
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setActaForm((s) => ({ ...s, usoVoz: "no_de_acuerdo" }))}
+                    className="flex-1 text-xs font-bold uppercase px-3 py-2 rounded-sm"
+                    style={
+                      actaForm.usoVoz === "no_de_acuerdo"
+                        ? { background: paprika, color: "#fff" }
+                        : { border: `1px solid ${ink}33`, color: ink, background: "#fff" }
+                    }
+                  >
+                    No estoy de acuerdo
+                  </button>
+                </div>
+                {actaForm.usoVoz === "de_acuerdo" && (
+                  <div className="text-[10px] mt-1" style={{ color: steel }}>
+                    En el acta quedará asentado que el trabajador hizo uso de la voz y estuvo de acuerdo, con una
+                    firma específica para este apartado.
+                  </div>
+                )}
+                {actaForm.usoVoz === "no_de_acuerdo" && (
+                  <div className="mt-2">
+                    <textarea
+                      value={actaForm.usoVozMotivo}
+                      onChange={(e) => setActaForm((s) => ({ ...s, usoVozMotivo: e.target.value }))}
+                      placeholder="Especifica qué manifestó el trabajador o por qué no está de acuerdo con el contenido del acta."
+                      rows={4}
+                      className="w-full px-2 py-1.5 rounded-sm text-xs outline-none"
+                      style={{ border: `1px solid ${ink}33`, background: "#fff", color: ink, resize: "vertical" }}
+                    />
+                    <div className="text-[10px] mt-1" style={{ color: steel }}>
+                      En el acta quedará asentado que el trabajador no está conforme y hizo uso de la voz, seguido
+                      de este texto, con una firma específica para este apartado.
+                    </div>
+                  </div>
+                )}
               </div>
 
               <div>
