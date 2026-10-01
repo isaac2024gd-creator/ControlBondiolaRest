@@ -823,6 +823,221 @@ function buildEmployeeMonthReport(emp, monthKeyStr, recordsByDate) {
   };
 }
 
+// ===================== impresión directa a impresora térmica (ESC/POS) =====================
+// Arma el ticket de propinas como comandos ESC/POS (el "idioma" de las impresoras de tickets)
+// para mandarlo directo por Bluetooth o por la app RawBT, sin el cuadro de impresión del navegador.
+function textoTicket(str) {
+  // las impresoras baratas no traen acentos confiables: se quitan (á→a, ñ→n) para que nunca salga basura
+  return String(str ?? "")
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "")
+    .replace(/[^\x20-\x7E]/g, "");
+}
+
+function buildTicketPropinasEscPos(t, ancho, businessConfig, modoEntrega) {
+  const cols = ancho === 80 ? 48 : 32;
+  const bytes = [];
+  const cmd = (...b) => bytes.push(...b);
+  const txt = (s) => {
+    for (const ch of textoTicket(s)) bytes.push(ch.charCodeAt(0));
+  };
+  const line = (s = "") => {
+    txt(s);
+    cmd(0x0a);
+  };
+  const center = (on) => cmd(0x1b, 0x61, on ? 1 : 0);
+  // todo el ticket va en negritas (y doble pasada) para que se lea bien en papel térmico chico
+  const bold = () => cmd(0x1b, 0x45, 1, 0x1b, 0x47, 1);
+  const big = (on) => cmd(0x1d, 0x21, on ? 0x11 : 0x00);
+  const sep = () => line("-".repeat(cols));
+  const wrap = (s) => {
+    const words = textoTicket(s).split(/\s+/).filter(Boolean);
+    const out = [];
+    let cur = "";
+    for (const w of words) {
+      if (!cur) cur = w.slice(0, cols);
+      else if ((cur + " " + w).length <= cols) cur += " " + w;
+      else {
+        out.push(cur);
+        cur = w.slice(0, cols);
+      }
+    }
+    if (cur) out.push(cur);
+    return out;
+  };
+  const row = (izq, der) => {
+    const d = textoTicket(der);
+    const maxIzq = cols - d.length - 1;
+    const lineasIzq = wrap(izq);
+    if (lineasIzq.length === 0) lineasIzq.push("");
+    lineasIzq.slice(0, -1).forEach((l) => line(l));
+    let ultima = lineasIzq[lineasIzq.length - 1];
+    if (ultima.length > maxIzq) {
+      line(ultima); // no cabe junto al monto: el nombre va completo y el monto en la línea de abajo
+      ultima = "";
+    }
+    line(ultima + " ".repeat(Math.max(1, cols - ultima.length - d.length)) + d);
+  };
+  const dinero = (n) => "$" + Math.floor(Number(n) || 0).toLocaleString("en-US");
+  const fFecha = (k) => {
+    const [y, m, d] = String(k || "").split("-").map(Number);
+    if (!y || !m || !d) return k || "-";
+    return new Date(y, m - 1, d).toLocaleDateString("es-MX", { weekday: "short", day: "2-digit", month: "short", year: "numeric" });
+  };
+  const fFechaHora = (dt) =>
+    dt.toLocaleString("es-MX", { day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" });
+
+  const inicio = t.fechaInicio || t.fecha;
+  const fin = t.fechaFin || t.fecha;
+  const conPropina = (t.reparto || []).filter((r) => (Number(r.monto) || 0) > 0);
+  const sinPropina = (t.reparto || []).filter((r) => !((Number(r.monto) || 0) > 0));
+  const repartido = conPropina.reduce((s, r) => s + (Number(r.monto) || 0), 0);
+  const sobrante = Math.max(0, Math.floor(Number(t.monto) || 0) - repartido);
+
+  cmd(0x1b, 0x40); // reiniciar impresora
+  center(true);
+  bold(true);
+  wrap(businessConfig?.nombre || "Restaurante").forEach((l) => line(l));
+  bold(false);
+  if (businessConfig?.sucursal) wrap(businessConfig.sucursal).forEach((l) => line(l));
+  if (businessConfig?.direccion) wrap(businessConfig.direccion).forEach((l) => line(l));
+  sep();
+  bold(true);
+  line("COMPROBANTE DE PROPINAS");
+  bold(false);
+  line("Folio " + String(t.id || "").slice(-6).toUpperCase());
+  center(false);
+  sep();
+  line("Periodo:");
+  bold(true);
+  (inicio === fin ? [fFecha(inicio)] : [fFecha(inicio), "al " + fFecha(fin)]).forEach((x) => wrap(x).forEach((l) => line(l)));
+  bold(false);
+  wrap("Registro: " + (t.quien || "-")).forEach((l) => line(l));
+  line("Guardado: " + (t.creadoEn ? fFechaHora(new Date(t.creadoEn)) : "-"));
+  line("Impreso: " + fFechaHora(new Date()));
+  sep();
+  bold(true);
+  row("TOTAL PROPINAS", dinero(t.monto));
+  bold(false);
+  row(`Repartido (${conPropina.length} pers.)`, dinero(repartido));
+  if (sobrante > 0) row("Sobrante (redondeo)", dinero(sobrante));
+  sep();
+  center(true);
+  bold(true);
+  line("DETALLE POR PERSONA");
+  bold(false);
+  center(false);
+  conPropina.forEach((r, i) => {
+    line();
+    bold(true);
+    row(r.employeeName, dinero(r.monto));
+    bold(false);
+    line(`${r.diasPropina}/${r.diasTrabajados} dias elegibles${r.tipo === "externo" ? " - externo" : ""}`);
+    (r.motivosCorreccion || []).forEach((c) =>
+      wrap(`* ${c.penalizacion ? "Penalizacion" : "Ajuste"}${c.motivo ? ": " + c.motivo : ""}`).forEach((l) => line(l))
+    );
+    line();
+    line();
+    center(true);
+    line("_".repeat(Math.min(cols, 28)));
+    line("Firma de recibido");
+    center(false);
+    if (i < conPropina.length - 1) sep();
+  });
+  if (sinPropina.length > 0) {
+    sep();
+    bold(true);
+    line("Sin propina en este periodo:");
+    bold(false);
+    sinPropina.forEach((r) => wrap(`- ${r.employeeName} (${r.diasPropina}/${r.diasTrabajados} dias)`).forEach((l) => line(l)));
+  }
+  sep();
+  wrap("Conteo realizado por: " + (t.quien || "-")).forEach((l) => line(l));
+  sep();
+  center(true);
+  wrap(
+    modoEntrega === "nomina"
+      ? "Monto que se pagara junto con la nomina del periodo. La firma confirma conformidad con el reparto."
+      : "Con su firma, cada persona confirma haber recibido en efectivo la cantidad indicada."
+  ).forEach((l) => line(l));
+  center(false);
+  cmd(0x0a, 0x0a, 0x0a, 0x0a);
+  cmd(0x1d, 0x56, 0x42, 0x00); // corte de papel (si la impresora tiene cortador; si no, se ignora)
+  return new Uint8Array(bytes);
+}
+
+// servicios Bluetooth (BLE) que usan las impresoras térmicas más comunes
+const SERVICIOS_IMPRESORA_BLE = [
+  "000018f0-0000-1000-8000-00805f9b34fb",
+  "0000ff00-0000-1000-8000-00805f9b34fb",
+  "0000ffe0-0000-1000-8000-00805f9b34fb",
+  "0000fee7-0000-1000-8000-00805f9b34fb",
+  "0000ae30-0000-1000-8000-00805f9b34fb",
+  "0000ae00-0000-1000-8000-00805f9b34fb",
+  "0000fff0-0000-1000-8000-00805f9b34fb",
+  "e7810a71-73ae-499d-8c15-faa9aef0c3f2",
+  "49535343-fe7d-4ae5-8fa9-9fafd205e455",
+];
+let impresoraBle = null; // { device, characteristic } — se recuerda mientras la app siga abierta
+
+async function conectarImpresoraBle(forzarNueva) {
+  if (!forzarNueva && impresoraBle?.device?.gatt) {
+    try {
+      if (!impresoraBle.device.gatt.connected) {
+        await impresoraBle.device.gatt.connect();
+        impresoraBle.characteristic = await buscarCaracteristicaEscritura(impresoraBle.device.gatt);
+      }
+      return impresoraBle;
+    } catch {
+      impresoraBle = null;
+    }
+  }
+  const device = await navigator.bluetooth.requestDevice({
+    acceptAllDevices: true,
+    optionalServices: SERVICIOS_IMPRESORA_BLE,
+  });
+  const gatt = await device.gatt.connect();
+  const characteristic = await buscarCaracteristicaEscritura(gatt);
+  impresoraBle = { device, characteristic };
+  return impresoraBle;
+}
+
+async function buscarCaracteristicaEscritura(gatt) {
+  const services = await gatt.getPrimaryServices();
+  for (const sv of services) {
+    let chars = [];
+    try {
+      chars = await sv.getCharacteristics();
+    } catch {
+      continue;
+    }
+    const c = chars.find((ch) => ch.properties.writeWithoutResponse || ch.properties.write);
+    if (c) return c;
+  }
+  throw new Error("SIN_CARACTERISTICA");
+}
+
+async function imprimirPorBluetooth(bytes, forzarNueva = false) {
+  const { characteristic } = await conectarImpresoraBle(forzarNueva);
+  const sinRespuesta = characteristic.properties.writeWithoutResponse;
+  const TAM = 100;
+  for (let i = 0; i < bytes.length; i += TAM) {
+    const trozo = bytes.slice(i, i + TAM);
+    if (sinRespuesta && characteristic.writeValueWithoutResponse) await characteristic.writeValueWithoutResponse(trozo);
+    else if (characteristic.writeValueWithResponse) await characteristic.writeValueWithResponse(trozo);
+    else await characteristic.writeValue(trozo);
+    await new Promise((r) => setTimeout(r, 25)); // pausa corta para no saturar el búfer de la impresora
+  }
+}
+
+// RawBT (app gratuita de Android) imprime por Bluetooth "clásico", que el navegador no puede usar directo
+function imprimirPorRawBT(bytes) {
+  let bin = "";
+  bytes.forEach((b) => (bin += String.fromCharCode(b)));
+  const b64 = btoa(bin);
+  window.location.href = `intent:base64,${b64}#Intent;scheme=rawbt;package=ru.a402d.rawbtprinter;end;`;
+}
+
 function escapeHtml(str) {
   return String(str ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
@@ -2803,6 +3018,38 @@ export default function RelojChecador() {
   const [propinasTicketView, setPropinasTicketView] = useState(null); // { registro, ancho }
   const [ticketAltoMm, setTicketAltoMm] = useState(200);
   const ticketRef = useRef(null);
+  const [ticketBtEstado, setTicketBtEstado] = useState(null); // { tipo: "info"|"ok"|"error", texto }
+  const [ticketBtOcupado, setTicketBtOcupado] = useState(false);
+  async function imprimirTicketDirecto(registro, ancho, forzarNueva = false) {
+    if (ticketBtOcupado) return;
+    if (!navigator.bluetooth) {
+      setTicketBtEstado({
+        tipo: "error",
+        texto:
+          "Este navegador no puede conectarse a impresoras Bluetooth. Usa Chrome en Android, o el botón RawBT.",
+      });
+      return;
+    }
+    setTicketBtOcupado(true);
+    setTicketBtEstado({ tipo: "info", texto: forzarNueva || !impresoraBle ? "Elige tu impresora en la lista…" : "Imprimiendo…" });
+    try {
+      const bytes = buildTicketPropinasEscPos(registro, ancho, businessConfig, propinasConfig.modoEntrega);
+      await imprimirPorBluetooth(bytes, forzarNueva);
+      setTicketBtEstado({ tipo: "ok", texto: `Ticket enviado a ${impresoraBle?.device?.name || "la impresora"}.` });
+    } catch (err) {
+      console.error("Impresión Bluetooth:", err);
+      const nombre = err?.name || "";
+      let texto = "No se pudo imprimir. Revisa que la impresora esté encendida y cerca, e intenta otra vez.";
+      if (nombre === "NotFoundError") texto = "No se eligió ninguna impresora.";
+      else if (err?.message === "SIN_CARACTERISTICA" || nombre === "NotSupportedError")
+        texto =
+          "Esta impresora no acepta conexión directa desde el navegador (usa Bluetooth clásico). Usa el botón RawBT.";
+      else if (nombre === "SecurityError") texto = "El navegador bloqueó el Bluetooth. Revisa los permisos de Chrome.";
+      setTicketBtEstado({ tipo: "error", texto });
+    } finally {
+      setTicketBtOcupado(false);
+    }
+  }
   const anchoTicketPreferido = (() => {
     try {
       return localStorage.getItem("propinas_ticket_ancho") === "80" ? 80 : 57;
@@ -2815,6 +3062,7 @@ export default function RelojChecador() {
       localStorage.setItem("propinas_ticket_ancho", String(ancho));
     } catch {}
     setPropinasTicketPrompt(null);
+    setTicketBtEstado(null);
     setPropinasTicketView({ registro, ancho });
   }
   // mide el alto real del ticket para que la hoja impresa sea del largo exacto (sin papel en blanco)
@@ -4082,7 +4330,7 @@ export default function RelojChecador() {
     const { registro: t, ancho } = propinasTicketView;
     const anchoPapel = ancho === 80 ? 80 : 57;
     const anchoContenido = ancho === 80 ? 72 : 48;
-    const fontPx = ancho === 80 ? 12.5 : 10.5;
+    const fontPx = ancho === 80 ? 13.5 : 11.5;
     const inicioT = t.fechaInicio || t.fecha;
     const finT = t.fechaFin || t.fecha;
     const fmtFechaT = (k) => {
@@ -4111,15 +4359,16 @@ export default function RelojChecador() {
             .ticket-area { padding: 0 !important; }
             .ticket { box-shadow: none !important; margin: 0 !important; }
           }
-          .ticket { font-family: 'Courier New', Courier, monospace; color: #000; line-height: 1.25; }
+          .ticket { font-family: 'Courier New', Courier, monospace; color: #000; line-height: 1.3; font-weight: 700; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+          .ticket, .ticket * { -webkit-text-stroke: 0.25px #000; }
           .ticket * { box-sizing: border-box; }
           .ticket .c { text-align: center; }
-          .ticket .b { font-weight: 700; }
-          .ticket .sm { font-size: 0.85em; }
-          .ticket .sep { border-top: 1px dashed #000; margin: 2mm 0; }
+          .ticket .b { font-weight: 900; }
+          .ticket .sm { font-size: 0.92em; }
+          .ticket .sep { border-top: 1.5px dashed #000; margin: 2mm 0; }
           .ticket .row { display: flex; justify-content: space-between; gap: 2mm; }
           .ticket .row > span:first-child { word-break: break-word; }
-          .ticket .firma { margin-top: 8mm; border-top: 1px solid #000; padding-top: 0.6mm; text-align: center; font-size: 0.8em; }
+          .ticket .firma { margin-top: 8mm; border-top: 1.5px solid #000; padding-top: 0.6mm; text-align: center; font-size: 0.8em; }
         `}</style>
 
         <div
@@ -4152,6 +4401,51 @@ export default function RelojChecador() {
           >
             <Printer size={14} /> Imprimir
           </button>
+        </div>
+
+        <div
+          className="no-print flex flex-col gap-2 px-4 py-3"
+          style={{ background: paper, borderBottom: `1px solid ${ink}22` }}
+        >
+          <div className="text-[10px] font-bold uppercase" style={{ color: ink + "88", letterSpacing: "0.05em" }}>
+            Imprimir directo a la impresora de tickets
+          </div>
+          <div className="flex gap-2">
+            <button
+              onClick={() => imprimirTicketDirecto(t, anchoPapel, false)}
+              disabled={ticketBtOcupado}
+              className="flex-1 flex items-center justify-center gap-1 py-2.5 rounded-sm font-bold text-xs uppercase disabled:opacity-50"
+              style={{ background: sage, color: paper }}
+            >
+              {ticketBtOcupado ? <Loader2 size={14} className="animate-spin" /> : <Printer size={14} />}
+              {impresoraBle ? "Imprimir Bluetooth" : "Buscar impresora"}
+            </button>
+            <button
+              onClick={() => imprimirPorRawBT(buildTicketPropinasEscPos(t, anchoPapel, businessConfig, propinasConfig.modoEntrega))}
+              className="flex items-center justify-center gap-1 px-3 py-2.5 rounded-sm font-bold text-xs uppercase"
+              style={{ border: `1px solid ${ink}33`, color: ink }}
+            >
+              RawBT
+            </button>
+          </div>
+          {impresoraBle && (
+            <button
+              onClick={() => imprimirTicketDirecto(t, anchoPapel, true)}
+              disabled={ticketBtOcupado}
+              className="text-[10px] font-bold uppercase self-start"
+              style={{ color: steel }}
+            >
+              Conectada: {impresoraBle.device?.name || "impresora"} · Cambiar impresora
+            </button>
+          )}
+          {ticketBtEstado && (
+            <div
+              className="text-[11px] font-semibold"
+              style={{ color: ticketBtEstado.tipo === "error" ? paprika : ticketBtEstado.tipo === "ok" ? sage : ink + "99" }}
+            >
+              {ticketBtEstado.texto}
+            </div>
+          )}
         </div>
 
         <div className="ticket-area" style={{ padding: "16px 0" }}>
@@ -4229,9 +4523,7 @@ export default function RelojChecador() {
               </>
             )}
             <div className="sep" />
-            <div className="firma" style={{ marginTop: "9mm" }}>
-              Entregó: {t.quien || "________________"}
-            </div>
+            <div>Conteo realizado por: {t.quien || "—"}</div>
             <div className="sep" />
             <div className="c sm">
               {enNomina
