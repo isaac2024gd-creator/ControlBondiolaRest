@@ -501,14 +501,7 @@ export default function DiaInventario() {
           />
         )}
         {tab === "inventario" && <InventarioTab items={items} onSave={persist} showToast={showToast} />}
-        {tab === "pendientes" && (
-          <PendientesTab
-            items={items}
-            estadoAreas={estadoAreas}
-            historialReciente={historialReciente}
-            onSaveEstadoAreas={persistEstadoAreas}
-          />
-        )}
+        {tab === "pendientes" && <PendientesTab items={items} estadoAreas={estadoAreas} historialReciente={historialReciente} />}
         {tab === "historial" && <HistorialTab items={items} />}
       </main>
 
@@ -912,25 +905,18 @@ function AreaPicker({ areas, sinArea, onElegir, onCancelar, estadoAreas, hoyStr 
           const estado = estadoAreas?.[hoy]?.[a];
           const terminada = !!estado?.finalizado;
           const enProgreso = !terminada && !!estado?.actualizadoEn;
-          const colorEstado = terminada ? C.ok : enProgreso ? C.warn : C.critical;
           return (
-            <button key={a} onClick={() => onElegir(a)} className="w-full py-4 rounded-2xl text-left px-5 flex items-center justify-between" style={{ background: C.paper, border: `1.5px solid ${colorEstado}` }}>
-              <div className="min-w-0 flex items-center gap-2.5">
-                <span className="rounded-full flex-shrink-0" style={{ width: 9, height: 9, background: colorEstado }} />
-                <div className="min-w-0">
-                  <span style={{ fontWeight: 600, fontSize: 15 }}>{a}</span>
-                  {terminada && (
-                    <div className="flex items-center gap-1 mt-0.5" style={{ fontSize: 11, color: C.ok, fontWeight: 600 }}>
-                      <Check size={12} /> Conteo terminado
-                    </div>
-                  )}
-                  {enProgreso && (
-                    <div style={{ fontSize: 11, color: C.warn, fontWeight: 600, marginTop: 2 }}>En progreso</div>
-                  )}
-                  {!terminada && !enProgreso && (
-                    <div style={{ fontSize: 11, color: C.critical, fontWeight: 600, marginTop: 2 }}>Sin iniciar</div>
-                  )}
-                </div>
+            <button key={a} onClick={() => onElegir(a)} className="w-full py-4 rounded-2xl text-left px-5 flex items-center justify-between" style={{ background: C.paper, border: `1px solid ${terminada ? C.ok : C.line}` }}>
+              <div className="min-w-0">
+                <span style={{ fontWeight: 600, fontSize: 15 }}>{a}</span>
+                {terminada && (
+                  <div className="flex items-center gap-1 mt-0.5" style={{ fontSize: 11, color: C.ok, fontWeight: 600 }}>
+                    <Check size={12} /> Conteo terminado
+                  </div>
+                )}
+                {enProgreso && (
+                  <div style={{ fontSize: 11, color: C.warn, fontWeight: 600, marginTop: 2 }}>En progreso</div>
+                )}
               </div>
               <ChevronRight size={18} style={{ color: C.inkSoft, flexShrink: 0 }} />
             </button>
@@ -1485,11 +1471,11 @@ function ResumenAreasHoy({ areasDelDia, estadoHoy, areasTerminadas }) {
           const estado = estadoHoy[a];
           const terminada = !!estado?.finalizado;
           const enProgreso = !terminada && !!estado?.actualizadoEn;
-          const color = terminada ? C.ok : enProgreso ? C.warn : C.critical;
-          const bg = terminada ? C.okBg : enProgreso ? C.warnBg : C.criticalBg;
+          const color = terminada ? C.ok : enProgreso ? C.warn : C.inkSoft;
+          const bg = terminada ? C.okBg : enProgreso ? C.warnBg : C.bg;
           return (
             <span key={a} className="flex items-center gap-1 px-2.5 py-1.5 rounded-full" style={{ background: bg, color, fontSize: 11.5, fontWeight: 600 }}>
-              {terminada ? <Check size={11} /> : enProgreso ? <Loader2 size={11} /> : <X size={11} />}
+              {terminada ? <Check size={11} /> : enProgreso ? <Loader2 size={11} /> : null}
               {a}
             </span>
           );
@@ -1564,7 +1550,7 @@ function ResumenCierreDia({ diaCerrado, cierreHoy, cerrando, reabriendoDia, onCe
   );
 }
 
-function PendientesTab({ items, estadoAreas, historialReciente, onSaveEstadoAreas }) {
+function PendientesTab({ items, estadoAreas, historialReciente }) {
   const [checked, setChecked] = useState({});
   const [cargandoChecked, setCargandoChecked] = useState(true);
   // Si el día de hoy ya se marcó como "cerrado" desde esta misma pestaña — evita que la
@@ -1574,11 +1560,6 @@ function PendientesTab({ items, estadoAreas, historialReciente, onSaveEstadoArea
   const [reabriendoDia, setReabriendoDia] = useState(false);
   const [confirmCerrar, setConfirmCerrar] = useState(false);
   const [confirmReabrirDia, setConfirmReabrirDia] = useState(false);
-  // Reinicio manual del día: a diferencia de "Cerrar día" (que solo bloquea la lista),
-  // esto borra el progreso de HOY (pendientes marcados, cierre, y conteo por área) para
-  // empezar como si fuera un día nuevo, sin esperar a que cambie la fecha del calendario.
-  const [reiniciando, setReiniciando] = useState(false);
-  const [confirmReiniciar, setConfirmReiniciar] = useState(false);
   const diaManana = (new Date().getDay() + 1) % 7;
   const hoyStr = hoyLocalStr();
 
@@ -1681,32 +1662,6 @@ function PendientesTab({ items, estadoAreas, historialReciente, onSaveEstadoArea
     setConfirmReabrirDia(false);
   }
 
-  // Reinicia el día de hoy a mano: borra los pendientes marcados, quita el cierre si lo
-  // había, y borra el conteo por área de hoy (vuelven a verse como "sin iniciar"). NO
-  // borra el inventario ni las cantidades contadas — solo el progreso/estado del día.
-  async function reiniciarDia() {
-    setReiniciando(true);
-    try {
-      setChecked({});
-      await storageSetRetry("dia_pendientes_checked_v1", {});
-
-      const nuevoCierre = { ...(cierreDia || {}) };
-      delete nuevoCierre[hoyStr];
-      setCierreDia(nuevoCierre);
-      await storageSetRetry("dia_pendientes_cerrado_v1", nuevoCierre);
-
-      if (onSaveEstadoAreas) {
-        const nuevoEstadoAreas = { ...(estadoAreas || {}) };
-        delete nuevoEstadoAreas[hoyStr];
-        await onSaveEstadoAreas(nuevoEstadoAreas);
-      }
-    } catch (e) {
-      console.error("Error reiniciando el día:", e);
-    }
-    setReiniciando(false);
-    setConfirmReiniciar(false);
-  }
-
   const pendientes = useMemo(() => {
     return items
       .map((i) => ({ ...i, minimoManana: nivelEfectivo(i, diaManana) }))
@@ -1767,15 +1722,6 @@ function PendientesTab({ items, estadoAreas, historialReciente, onSaveEstadoArea
           <p style={{ fontWeight: 600, fontSize: 15 }}>Todo listo para mañana</p>
           <p style={{ fontSize: 13, color: C.inkSoft, marginTop: 4 }}>Nada por debajo de su mínimo diario.</p>
         </div>
-        <button
-          onClick={() => setConfirmReiniciar(true)}
-          disabled={reiniciando}
-          className="w-full flex items-center justify-center gap-2 py-2.5 rounded-xl font-medium text-xs mt-6 mb-2"
-          style={{ background: "transparent", border: `1px solid ${C.critical}`, color: C.critical, opacity: reiniciando ? 0.7 : 1 }}
-        >
-          {reiniciando ? <Loader2 size={13} className="animate-spin" /> : <X size={13} />}
-          {reiniciando ? "Reiniciando..." : "Reiniciar día"}
-        </button>
         {confirmCerrar && (
           <ConfirmAccion
             text="¿Cerrar el día? La lista de Mañana quedará marcada como revisada y no se podrá seguir marcando hasta que la reabras o empiece el día siguiente."
@@ -1792,15 +1738,6 @@ function PendientesTab({ items, estadoAreas, historialReciente, onSaveEstadoArea
             confirmColor={C.warn}
             onCancel={() => setConfirmReabrirDia(false)}
             onConfirm={reabrirDia}
-          />
-        )}
-        {confirmReiniciar && (
-          <ConfirmAccion
-            text='¿Reiniciar el día? Se borra el progreso de hoy (pendientes marcados, cierre del día y conteo por área — vuelven a verse como "sin iniciar"). El inventario y las cantidades contadas NO se borran. Esta acción no se puede deshacer.'
-            confirmLabel={reiniciando ? "Reiniciando..." : "Sí, reiniciar día"}
-            confirmColor={C.critical}
-            onCancel={() => setConfirmReiniciar(false)}
-            onConfirm={reiniciarDia}
           />
         )}
       </div>
@@ -1939,25 +1876,6 @@ function PendientesTab({ items, estadoAreas, historialReciente, onSaveEstadoArea
           onConfirm={reabrirDia}
         />
       )}
-
-      <button
-        onClick={() => setConfirmReiniciar(true)}
-        disabled={reiniciando}
-        className="w-full flex items-center justify-center gap-2 py-2.5 rounded-xl font-medium text-xs mt-3"
-        style={{ background: "transparent", border: `1px solid ${C.critical}`, color: C.critical, opacity: reiniciando ? 0.7 : 1 }}
-      >
-        {reiniciando ? <Loader2 size={13} className="animate-spin" /> : <X size={13} />}
-        {reiniciando ? "Reiniciando..." : "Reiniciar día"}
-      </button>
-      {confirmReiniciar && (
-        <ConfirmAccion
-          text='¿Reiniciar el día? Se borra el progreso de hoy (pendientes marcados, cierre del día y conteo por área — vuelven a verse como "sin iniciar"). El inventario y las cantidades contadas NO se borran. Esta acción no se puede deshacer.'
-          confirmLabel={reiniciando ? "Reiniciando..." : "Sí, reiniciar día"}
-          confirmColor={C.critical}
-          onCancel={() => setConfirmReiniciar(false)}
-          onConfirm={reiniciarDia}
-        />
-      )}
     </div>
   );
 }
@@ -2057,3 +1975,4 @@ function HistorialTab({ items }) {
     </div>
   );
 }
+
