@@ -31,6 +31,7 @@ import {
   Fingerprint,
   Pencil,
   Info,
+  Printer,
 } from "lucide-react";
 
 /* ============================================================
@@ -2797,6 +2798,35 @@ export default function RelojChecador() {
   const [propinasOverwriteConfirm, setPropinasOverwriteConfirm] = useState(null);
   const propinasGuardandoRef = useRef(false);
 
+  // Ticket de propinas (impresora térmica 57/80 mm) para firma de recibido
+  const [propinasTicketPrompt, setPropinasTicketPrompt] = useState(null); // registro recién guardado
+  const [propinasTicketView, setPropinasTicketView] = useState(null); // { registro, ancho }
+  const [ticketAltoMm, setTicketAltoMm] = useState(200);
+  const ticketRef = useRef(null);
+  const anchoTicketPreferido = (() => {
+    try {
+      return localStorage.getItem("propinas_ticket_ancho") === "80" ? 80 : 57;
+    } catch {
+      return 57;
+    }
+  })();
+  function abrirTicketPropinas(registro, ancho) {
+    try {
+      localStorage.setItem("propinas_ticket_ancho", String(ancho));
+    } catch {}
+    setPropinasTicketPrompt(null);
+    setPropinasTicketView({ registro, ancho });
+  }
+  // mide el alto real del ticket para que la hoja impresa sea del largo exacto (sin papel en blanco)
+  useEffect(() => {
+    if (!propinasTicketView) return;
+    const id = requestAnimationFrame(() => {
+      const el = ticketRef.current;
+      if (el) setTicketAltoMm(Math.ceil((el.scrollHeight * 25.4) / 96) + 6);
+    });
+    return () => cancelAnimationFrame(id);
+  }, [propinasTicketView]);
+
   // configuración global de propinas: visible para cualquiera, pero solo se edita con PIN.
   // toleranciaMin: minutos para calificar a propina · frecuencia: cada cuánto se cierra el
   // reparto (diaria/semanal/mensual) · modoEntrega: si se paga aparte cada vez, o se junta
@@ -3311,6 +3341,7 @@ export default function RelojChecador() {
           ? formatDateLabel(fechaInicio, today)
           : `${formatDateLabel(fechaInicio, today)} – ${formatDateLabel(fechaFin, today)}`;
       setToast({ color: sage, text: `Propinas de ${rangoLabel} guardadas correctamente.` });
+      setPropinasTicketPrompt(nuevo); // ofrecer imprimir ticket para firmas
     } catch (err) {
       console.error("Error al guardar reparto:", err);
       setToast({ color: paprika, text: "Error al guardar — revisa tu conexión e intenta de nuevo." });
@@ -4045,6 +4076,173 @@ export default function RelojChecador() {
   const charcoal = "#201E1B";
   const brass = "#D6A24C";
   const steel = "#8A8F86";
+
+  // ---------- ticket de propinas (impresora térmica 57 / 80 mm) ----------
+  if (propinasTicketView) {
+    const { registro: t, ancho } = propinasTicketView;
+    const anchoPapel = ancho === 80 ? 80 : 57;
+    const anchoContenido = ancho === 80 ? 72 : 48;
+    const fontPx = ancho === 80 ? 12.5 : 10.5;
+    const inicioT = t.fechaInicio || t.fecha;
+    const finT = t.fechaFin || t.fecha;
+    const fmtFechaT = (k) => {
+      const [y, m, d] = String(k || "").split("-").map(Number);
+      if (!y || !m || !d) return k || "—";
+      return new Date(y, m - 1, d).toLocaleDateString("es-MX", { weekday: "short", day: "2-digit", month: "short", year: "numeric" });
+    };
+    const fmtFechaHoraT = (dt) =>
+      dt.toLocaleString("es-MX", { day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" });
+    const periodoT = inicioT === finT ? fmtFechaT(inicioT) : `${fmtFechaT(inicioT)} al ${fmtFechaT(finT)}`;
+    const conPropina = (t.reparto || []).filter((r) => (Number(r.monto) || 0) > 0);
+    const sinPropina = (t.reparto || []).filter((r) => !((Number(r.monto) || 0) > 0));
+    const totalRepartido = conPropina.reduce((s, r) => s + (Number(r.monto) || 0), 0);
+    const sobranteT = Math.max(0, Math.floor(Number(t.monto) || 0) - totalRepartido);
+    const enNomina = propinasConfig.modoEntrega === "nomina";
+    const folioT = String(t.id || "").slice(-6).toUpperCase();
+
+    return (
+      <div className="ticket-wrap" style={{ background: "#2a2a2a", minHeight: "100vh" }}>
+        <style>{`
+          @page { size: ${anchoPapel}mm ${ticketAltoMm}mm; margin: 0; }
+          @media print {
+            html, body, #root { background: #fff !important; height: auto !important; }
+            .no-print { display: none !important; }
+            .ticket-wrap { background: #fff !important; min-height: 0 !important; padding: 0 !important; }
+            .ticket-area { padding: 0 !important; }
+            .ticket { box-shadow: none !important; margin: 0 !important; }
+          }
+          .ticket { font-family: 'Courier New', Courier, monospace; color: #000; line-height: 1.25; }
+          .ticket * { box-sizing: border-box; }
+          .ticket .c { text-align: center; }
+          .ticket .b { font-weight: 700; }
+          .ticket .sm { font-size: 0.85em; }
+          .ticket .sep { border-top: 1px dashed #000; margin: 2mm 0; }
+          .ticket .row { display: flex; justify-content: space-between; gap: 2mm; }
+          .ticket .row > span:first-child { word-break: break-word; }
+          .ticket .firma { margin-top: 8mm; border-top: 1px solid #000; padding-top: 0.6mm; text-align: center; font-size: 0.8em; }
+        `}</style>
+
+        <div
+          className="no-print flex items-center justify-between gap-2 px-4 py-3"
+          style={{ position: "sticky", top: 0, background: paper, borderBottom: `1px solid ${ink}22`, zIndex: 10 }}
+        >
+          <button onClick={() => setPropinasTicketView(null)} className="text-sm font-bold" style={{ color: ink }}>
+            ← Volver
+          </button>
+          <div className="flex items-center gap-1">
+            {[57, 80].map((w) => (
+              <button
+                key={w}
+                onClick={() => abrirTicketPropinas(t, w)}
+                className="px-2.5 py-1.5 rounded-sm text-[11px] font-bold"
+                style={
+                  anchoPapel === w
+                    ? { background: ink, color: paper }
+                    : { border: `1px solid ${ink}33`, color: ink }
+                }
+              >
+                {w} mm
+              </button>
+            ))}
+          </div>
+          <button
+            onClick={() => window.print()}
+            className="flex items-center gap-1 px-3 py-1.5 rounded-sm font-bold text-xs uppercase"
+            style={{ background: brass, color: ink }}
+          >
+            <Printer size={14} /> Imprimir
+          </button>
+        </div>
+
+        <div className="ticket-area" style={{ padding: "16px 0" }}>
+          <div
+            ref={ticketRef}
+            className="ticket"
+            style={{
+              width: `${anchoPapel}mm`,
+              padding: `3mm ${(anchoPapel - anchoContenido) / 2}mm 6mm`,
+              margin: "0 auto",
+              background: "#fff",
+              fontSize: fontPx,
+              boxShadow: "0 2px 10px #0006",
+            }}
+          >
+            <div className="c b" style={{ fontSize: "1.2em" }}>
+              {businessConfig?.nombre || "Restaurante"}
+            </div>
+            {businessConfig?.sucursal && <div className="c sm">{businessConfig.sucursal}</div>}
+            {businessConfig?.direccion && <div className="c sm">{businessConfig.direccion}</div>}
+            <div className="sep" />
+            <div className="c b">COMPROBANTE DE PROPINAS</div>
+            <div className="c sm">Folio {folioT}</div>
+            <div className="sep" />
+            <div className="sm">Periodo:</div>
+            <div className="b">{periodoT}</div>
+            <div className="sm" style={{ marginTop: "1mm" }}>Registró: {t.quien || "—"}</div>
+            <div className="sm">Guardado: {t.creadoEn ? fmtFechaHoraT(new Date(t.creadoEn)) : "—"}</div>
+            <div className="sm">Impreso: {fmtFechaHoraT(new Date())}</div>
+            <div className="sep" />
+            <div className="row b" style={{ fontSize: "1.15em" }}>
+              <span>TOTAL PROPINAS</span>
+              <span>{formatMoneyNoDecimal(t.monto)}</span>
+            </div>
+            <div className="row sm">
+              <span>Repartido ({conPropina.length} pers.)</span>
+              <span>{formatMoneyNoDecimal(totalRepartido)}</span>
+            </div>
+            {sobranteT > 0 && (
+              <div className="row sm">
+                <span>Sobrante (redondeo)</span>
+                <span>{formatMoneyNoDecimal(sobranteT)}</span>
+              </div>
+            )}
+            <div className="sep" />
+            <div className="c b sm">DETALLE POR PERSONA</div>
+            {conPropina.map((r, i) => (
+              <div key={r.employeeId || i} style={{ marginTop: "2.5mm" }}>
+                <div className="row b">
+                  <span>{r.employeeName}</span>
+                  <span>{formatMoneyNoDecimal(r.monto)}</span>
+                </div>
+                <div className="sm">
+                  {r.diasPropina}/{r.diasTrabajados} días elegibles{r.tipo === "externo" ? " · externo" : ""}
+                </div>
+                {(r.motivosCorreccion || []).map((c, j) => (
+                  <div key={j} className="sm">
+                    * {c.penalizacion ? "Penalización" : "Ajuste"}
+                    {c.motivo ? `: ${c.motivo}` : ""}
+                  </div>
+                ))}
+                <div className="firma">Firma de recibido</div>
+                {i < conPropina.length - 1 && <div className="sep" style={{ marginTop: "2.5mm" }} />}
+              </div>
+            ))}
+            {sinPropina.length > 0 && (
+              <>
+                <div className="sep" />
+                <div className="sm b">Sin propina en este periodo:</div>
+                {sinPropina.map((r, i) => (
+                  <div key={r.employeeId || i} className="sm">
+                    - {r.employeeName} ({r.diasPropina}/{r.diasTrabajados} días)
+                  </div>
+                ))}
+              </>
+            )}
+            <div className="sep" />
+            <div className="firma" style={{ marginTop: "9mm" }}>
+              Entregó: {t.quien || "________________"}
+            </div>
+            <div className="sep" />
+            <div className="c sm">
+              {enNomina
+                ? "Monto que se pagará junto con la nómina del periodo. La firma confirma conformidad con el reparto."
+                : "Con su firma, cada persona confirma haber recibido en efectivo la cantidad indicada."}
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   // ---------- recibo de nómina imprimible ----------
   if (payrollPrintView) {
@@ -7215,6 +7413,53 @@ export default function RelojChecador() {
             })()}
           </div>
 
+          {/* MODAL: ofrecer ticket de propinas tras guardar */}
+          {propinasTicketPrompt && (
+            <div
+              className="fixed inset-0 flex items-end sm:items-center justify-center z-50 p-4"
+              style={{ background: "#00000099" }}
+            >
+              <div className="w-full max-w-sm rounded-sm p-5" style={{ background: paper }}>
+                <div className="flex items-center gap-2 mb-2">
+                  <Printer size={18} color={sage} />
+                  <div className="text-sm font-bold" style={{ color: ink }}>
+                    Reparto guardado
+                  </div>
+                </div>
+                <p className="text-xs mb-1" style={{ color: ink + "88" }}>
+                  ¿Imprimir ticket con las propinas por persona para que firmen de recibido?
+                </p>
+                <p className="text-xs mb-4" style={{ color: ink }}>
+                  Total: <strong>{formatMoneyNoDecimal(propinasTicketPrompt.monto)}</strong> ·{" "}
+                  {(propinasTicketPrompt.reparto || []).filter((r) => (Number(r.monto) || 0) > 0).length} personas
+                </p>
+                <div className="flex gap-2 mb-2">
+                  {[57, 80].map((w) => (
+                    <button
+                      key={w}
+                      onClick={() => abrirTicketPropinas(propinasTicketPrompt, w)}
+                      className="flex-1 flex items-center justify-center gap-1 py-2.5 rounded-sm font-bold text-xs uppercase"
+                      style={
+                        anchoTicketPreferido === w
+                          ? { background: brass, color: ink }
+                          : { border: `1px solid ${ink}33`, color: ink }
+                      }
+                    >
+                      <Printer size={14} /> Ticket {w} mm
+                    </button>
+                  ))}
+                </div>
+                <button
+                  onClick={() => setPropinasTicketPrompt(null)}
+                  className="w-full py-2.5 rounded-sm font-bold text-xs uppercase"
+                  style={{ background: ink + "11", color: ink }}
+                >
+                  Ahora no
+                </button>
+              </div>
+            </div>
+          )}
+
           {/* MODAL: Confirmación de sobrescritura de propinas */}
           {propinasOverwriteConfirm && (
             <div
@@ -7640,6 +7885,18 @@ export default function RelojChecador() {
                                   </div>
                                 )}
                               </div>
+                            ))}
+                          </div>
+                          <div className="flex gap-2 mt-2">
+                            {[57, 80].map((w) => (
+                              <button
+                                key={w}
+                                onClick={() => abrirTicketPropinas(p, w)}
+                                className="flex-1 flex items-center justify-center gap-1 py-1.5 rounded-sm text-[10px] font-bold uppercase"
+                                style={{ border: `1px solid ${ink}33`, color: ink }}
+                              >
+                                <Printer size={12} /> Ticket {w} mm
+                              </button>
                             ))}
                           </div>
                         </div>
