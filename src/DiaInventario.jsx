@@ -319,11 +319,106 @@ function hoyLocalStr(d = new Date()) {
   return `${y}-${m}-${day}`;
 }
 
+/* ---------- Historial de DÍA: UN REGISTRO POR DÍA ----------
+   Antes todo el historial (45 días × ~190 productos, ~1.5 MB) vivía en una sola clave
+   (`dia_historial_v1`) y se volvía a subir COMPLETO en cada guardado. Ahora cada día es
+   su propia fila (`dia-hist:2026-09-30`, ~11 KB): guardar el conteo solo sube la foto de
+   HOY. Para leer se piden las filas más recientes de una vez.
+   Transición: si todavía hay datos en la clave vieja (o un teléfono con la app vieja
+   escribe ahí), se leen también y se pasan a filas por día en segundo plano. */
+const HIST_DIA_PREFIJO = "dia-hist:";
+const HIST_DIA_LEGADO = "dia_historial_v1";
+const HIST_DIA_MAX = 45;      // días que se usan para promedios
+const HIST_DIA_BORRAR_DIAS = 90; // filas más viejas que esto se borran solas
+
+function sumarDiasStr(diaStr, n) {
+  const [y, m, d] = diaStr.split("-").map(Number);
+  return hoyLocalStr(new Date(y, m - 1, d + n));
+}
+
+/* Lee las filas cuya clave empieza con `prefijo`, de la más nueva a la más vieja. */
+async function kvListarPrefijo(prefijo, tabla, limite) {
+  const { data, error } = await supabase
+    .from(tabla)
+    .select("key, value")
+    .like("key", `${prefijo}%`)
+    .order("key", { ascending: false })
+    .limit(limite);
+  if (error) throw error;
+  return data || [];
+}
+
+/* Junta entradas { fecha, items } dejando solo la más reciente de cada día (local). */
+function ultimaPorDia(entradas, porDia = {}) {
+  (entradas || []).forEach((e) => {
+    if (!e || !e.fecha || !Array.isArray(e.items)) return;
+    const dia = hoyLocalStr(new Date(e.fecha));
+    if (!porDia[dia] || porDia[dia].fecha < e.fecha) porDia[dia] = e;
+  });
+  return porDia;
+}
+
+/* Historial de DÍA ordenado del día más viejo al más nuevo (máximo `limite` días). */
+async function leerHistorialDia(limite = HIST_DIA_MAX) {
+  const filas = await kvListarPrefijo(HIST_DIA_PREFIJO, "kv_store_dia", limite);
+  const porDia = ultimaPorDia(filas.map((f) => f.value));
+  try {
+    const legado = await kvGet(HIST_DIA_LEGADO, "kv_store_dia");
+    if (Array.isArray(legado) && legado.length) ultimaPorDia(legado, porDia);
+  } catch (e) { /* la clave vieja es opcional */ }
+  return Object.keys(porDia).sort().slice(-limite).map((d) => porDia[d]);
+}
+
+/* Guarda la foto de un día en su propia fila. Si otro teléfono ya guardó una foto MÁS
+   NUEVA de ese mismo día, no la pisa. */
+async function guardarEntradaHistorialDia(entrada) {
+  const dia = hoyLocalStr(new Date(entrada.fecha));
+  return guardarMezclando(HIST_DIA_PREFIJO + dia, (base) =>
+    base && base.fecha && base.fecha >= entrada.fecha ? undefined : entrada
+  );
+}
+
+/* Borra (en segundo plano) las filas de historial de hace más de HIST_DIA_BORRAR_DIAS días. */
+async function podarHistorialDia() {
+  try {
+    const limite = sumarDiasStr(hoyLocalStr(), -HIST_DIA_BORRAR_DIAS);
+    await supabase.from("kv_store_dia").delete()
+      .like("key", `${HIST_DIA_PREFIJO}%`)
+      .lt("key", HIST_DIA_PREFIJO + limite);
+  } catch (e) { /* no importa si falla: se intenta en el siguiente guardado */ }
+}
+
+/* Pasa lo que haya en la clave vieja (un solo bloque grande) a filas por día y lo quita
+   de ahí. Se puede correr varias veces sin duplicar nada. */
+let migrandoHistorialDia = false;
+async function migrarHistorialDiaLegado() {
+  if (migrandoHistorialDia) return;
+  migrandoHistorialDia = true;
+  try {
+    const legado = await kvGet(HIST_DIA_LEGADO, "kv_store_dia");
+    if (!Array.isArray(legado) || legado.length === 0) return;
+    const porDia = ultimaPorDia(legado);
+    for (const dia of Object.keys(porDia).sort()) {
+      const r = await guardarEntradaHistorialDia(porDia[dia]);
+      if (!r.ok) return; // se reintenta la próxima vez que se abra la app
+    }
+    const pasadas = new Set(legado.map((e) => e && e.fecha));
+    await guardarMezclando(HIST_DIA_LEGADO, (base) => {
+      if (!Array.isArray(base) || base.length === 0) return undefined;
+      const resto = base.filter((e) => !pasadas.has(e && e.fecha));
+      return resto.length === base.length ? undefined : resto;
+    });
+  } catch (e) {
+    /* se reintenta la próxima vez */
+  } finally {
+    migrandoHistorialDia = false;
+  }
+}
+
 /* Guarda la "foto" del día en el historial (para promedios). Corre en segundo plano
-   (no hace esperar a quien cuenta) y mezclando, para que dos teléfonos no se pisen. */
+   (no hace esperar a quien cuenta). Solo sube la fila de HOY. */
 async function appendHistorial(items, fecha, diaObjetivo) {
   try {
-    const diaKey = hoyLocalStr(new Date(fecha)); // YYYY-MM-DD, día calendario LOCAL
     const entrada = {
       fecha,
       items: items.map((i) => ({
@@ -333,16 +428,9 @@ async function appendHistorial(items, fecha, diaObjetivo) {
       })),
     };
     // Si ya se guardó algo hoy (otra área, u otro guardado del mismo día), se reemplaza
-    // esa entrada con la foto completa más reciente en vez de agregar una nueva — evita
-    // contar el mismo día dos veces en los promedios de consumo.
-    await guardarMezclando("dia_historial_v1", (base) => {
-      let hist = Array.isArray(base) ? [...base] : [];
-      const idxHoy = hist.findIndex((h) => h.fecha && hoyLocalStr(new Date(h.fecha)) === diaKey);
-      if (idxHoy >= 0) hist[idxHoy] = entrada;
-      else hist.push(entrada);
-      if (hist.length > 45) hist = hist.slice(hist.length - 45);
-      return hist;
-    });
+    // con la foto completa más reciente — no se cuenta el mismo día dos veces.
+    await guardarEntradaHistorialDia(entrada);
+    podarHistorialDia();
   } catch (e) {
     /* no bloquea el guardado del conteo si el historial falla */
   }
@@ -447,7 +535,7 @@ export default function DiaInventario() {
     })();
     (async () => {
       try {
-        const hist = await kvGet("dia_historial_v1");
+        const hist = await leerHistorialDia(10); // solo hacen falta los últimos días
         const hoy = hoyLocalStr();
         const map = {};
         (hist || []).forEach((registro) => {
@@ -507,6 +595,8 @@ export default function DiaInventario() {
           migrarFotosEmbebidas(value, "dia_items_v1", "kv_store_dia", "dia")
             .then((aplicarEnPantalla) => { if (aplicarEnPantalla) setItems((prev) => (prev ? aplicarEnPantalla(prev) : prev)); })
             .catch(() => {});
+          // Historial viejo (un solo bloque de ~1.5 MB) → una fila por día, en segundo plano.
+          migrarHistorialDiaLegado();
         } else {
           const fecha = new Date().toISOString();
           await kvSet("dia_items_v1", SEED_ITEMS);
@@ -2109,7 +2199,7 @@ function HistorialTab({ items }) {
   useEffect(() => {
     (async () => {
       try {
-        const val = await kvGet("dia_historial_v1");
+        const val = await leerHistorialDia();
         setHistorial(val || []);
       } catch (e) {
         setHistorial([]);

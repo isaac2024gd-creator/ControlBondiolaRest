@@ -5,7 +5,7 @@ import {
   Package, ClipboardList, Receipt, Plus, Minus, Trash2, Search,
   ChevronDown, ChevronRight, Check, X, AlertTriangle, Loader2,
   Pencil, RotateCcw, Save, Camera, TrendingUp, BarChart2,
-  Download, Upload, Copy, ClipboardCopy
+  Download, Upload, Copy, ClipboardCopy, Lock
 } from "lucide-react";
 
 /* Mismo proyecto Supabase que Checador/DÍA/Limpieza — tabla propia de PAR */
@@ -72,11 +72,64 @@ async function storageSetRetryConVersion(key, value, expectedUpdatedAt, tabla = 
   return { ok: false, error: ultimoError };
 }
 
+/* ---------- Historiales: UN REGISTRO POR DÍA ----------
+   Antes cada historial era una sola clave enorme que se volvía a subir COMPLETA en cada
+   guardado (DÍA ~1.5 MB, PAR ~1.6 MB). Ahora cada día es su propia fila
+   (`dia-hist:2026-09-30` en kv_store_dia, `par-hist:2026-09-28` en kv_store): guardar
+   solo sube la foto de ese día. Mientras quede algo en las claves viejas (o un teléfono
+   con la app vieja escriba ahí) también se lee, y PAR pasa el suyo a filas en segundo plano. */
+const HIST_DIA_PREFIJO = "dia-hist:";
+const HIST_DIA_LEGADO = "dia_historial_v1";
+const HIST_PAR_PREFIJO = "par-hist:";
+const HIST_PAR_LEGADO = "historial_conteos_v2";
+const HIST_PAR_MAX = 30;          // días de conteo que se usan en Consumo
+const HIST_PAR_BORRAR_DIAS = 400; // filas más viejas que esto se borran solas
+
+function diaLocalStr(d = new Date()) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+async function kvListarPrefijo(prefijo, tabla, limite) {
+  const { data, error } = await supabase
+    .from(tabla)
+    .select("key, value")
+    .like("key", `${prefijo}%`)
+    .order("key", { ascending: false })
+    .limit(limite);
+  if (error) throw error;
+  return data || [];
+}
+
+/* Junta entradas { fecha, items } dejando solo la más reciente de cada día (local). */
+function ultimaPorDia(entradas, porDia = {}) {
+  (entradas || []).forEach((e) => {
+    if (!e || !e.fecha || !Array.isArray(e.items)) return;
+    const dia = diaLocalStr(new Date(e.fecha));
+    if (!porDia[dia] || porDia[dia].fecha < e.fecha) porDia[dia] = e;
+  });
+  return porDia;
+}
+
+/* Lee un historial por día (filas nuevas + clave vieja si aún tiene algo), ordenado del
+   día más viejo al más nuevo, máximo `limite` días. */
+async function leerHistorialPorDia(prefijo, legado, tabla, limite) {
+  const filas = await kvListarPrefijo(prefijo, tabla, limite);
+  const porDia = ultimaPorDia(filas.map((f) => f.value));
+  try {
+    const viejo = await kvGet(legado, tabla);
+    if (Array.isArray(viejo) && viejo.length) ultimaPorDia(viejo, porDia);
+  } catch (e) { /* la clave vieja es opcional */ }
+  return Object.keys(porDia).sort().slice(-limite).map((d) => porDia[d]);
+}
+
 /* Lee el historial diario de DÍA (misma base de datos, tabla propia) para calcular
    cuánto se ha consumido de cada producto vinculado desde el último conteo real de PAR. */
 async function cargarHistorialDia() {
   try {
-    return (await kvGet("dia_historial_v1", "kv_store_dia")) || [];
+    return await leerHistorialPorDia(HIST_DIA_PREFIJO, HIST_DIA_LEGADO, "kv_store_dia", 45);
   } catch (e) {
     return [];
   }
@@ -247,6 +300,43 @@ async function migrarFotosEmbebidas(lista, key, tabla, carpeta, campoFoto = "fot
 
 const BORRADOR_KEY = "par_borrador_conteo_v1";
 
+/* ---------- Estado del conteo por área (semanal) ----------
+   PAR se cuenta una vez por semana, así que el "terminado / en progreso / sin iniciar"
+   de cada área vale para la SEMANA (lunes a domingo). Se guarda aparte del catálogo en
+   `par_areas_estado_v1` = { "2026-09-28" (lunes): { "Cocina Fría": { finalizado,
+   finalizadoEn, actualizadoEn } } }. Cada lunes todas las áreas vuelven a "sin iniciar"
+   solas, sin borrar nada. */
+const ESTADO_AREAS_KEY = "par_areas_estado_v1";
+
+function semanaDe(d = new Date()) {
+  const lunes = new Date(d.getFullYear(), d.getMonth(), d.getDate() - ((d.getDay() + 6) % 7));
+  return diaLocalStr(lunes);
+}
+
+function nombreSemana(semanaStr) {
+  const [y, m, d] = semanaStr.split("-").map(Number);
+  const ini = new Date(y, m - 1, d);
+  const fin = new Date(y, m - 1, d + 6);
+  const f = (x) => x.toLocaleDateString("es-MX", { day: "numeric", month: "short" });
+  return `${f(ini)} – ${f(fin)}`;
+}
+
+/* Guarda como máximo las últimas 12 semanas de estado (para que no crezca sin límite). */
+function podarSemanas(estado) {
+  const semanas = Object.keys(estado || {}).sort();
+  if (semanas.length <= 12) return estado || {};
+  const nuevo = { ...estado };
+  semanas.slice(0, semanas.length - 12).forEach((k) => delete nuevo[k]);
+  return nuevo;
+}
+
+function estadoDeArea(estadoAreas, semana, area) {
+  const e = estadoAreas?.[semana]?.[area];
+  const terminada = !!e?.finalizado;
+  const enProgreso = !terminada && !!e?.actualizadoEn;
+  return { e, terminada, enProgreso, color: terminada ? C.ok : enProgreso ? C.warn : C.critical, bg: terminada ? C.okBg : enProgreso ? C.warnBg : C.criticalBg };
+}
+
 function compressImage(file, maxSize = 260, quality = 0.6) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -305,8 +395,55 @@ function consolidateItems(items) {
   return Object.values(map);
 }
 
-/* Historial de conteos (para Consumo). Se guarda en segundo plano y mezclando, para no
-   hacer esperar a quien cuenta ni pisar el de otro teléfono. */
+/* Guarda la foto de un día de conteo en su propia fila. Si otro teléfono ya guardó una
+   foto MÁS NUEVA de ese mismo día, no la pisa. */
+async function guardarEntradaHistorialPar(entrada) {
+  const dia = diaLocalStr(new Date(entrada.fecha));
+  return guardarMezclando(HIST_PAR_PREFIJO + dia, (base) =>
+    base && base.fecha && base.fecha >= entrada.fecha ? undefined : entrada
+  );
+}
+
+async function podarHistorialPar() {
+  try {
+    const d = new Date();
+    d.setDate(d.getDate() - HIST_PAR_BORRAR_DIAS);
+    await supabase.from("kv_store").delete()
+      .like("key", `${HIST_PAR_PREFIJO}%`)
+      .lt("key", HIST_PAR_PREFIJO + diaLocalStr(d));
+  } catch (e) { /* se intenta en el siguiente guardado */ }
+}
+
+/* Pasa el historial viejo (un solo bloque grande) a filas por día y lo quita de ahí.
+   Se puede correr varias veces sin duplicar nada. */
+let migrandoHistorialPar = false;
+async function migrarHistorialParLegado() {
+  if (migrandoHistorialPar) return;
+  migrandoHistorialPar = true;
+  try {
+    const legado = await kvGet(HIST_PAR_LEGADO);
+    if (!Array.isArray(legado) || legado.length === 0) return;
+    const porDia = ultimaPorDia(legado);
+    for (const dia of Object.keys(porDia).sort()) {
+      const r = await guardarEntradaHistorialPar(porDia[dia]);
+      if (!r.ok) return; // se reintenta la próxima vez que se abra la app
+    }
+    const pasadas = new Set(legado.map((e) => e && e.fecha));
+    await guardarMezclando(HIST_PAR_LEGADO, (base) => {
+      if (!Array.isArray(base) || base.length === 0) return undefined;
+      const resto = base.filter((e) => !pasadas.has(e && e.fecha));
+      return resto.length === base.length ? undefined : resto;
+    });
+  } catch (e) {
+    /* se reintenta la próxima vez */
+  } finally {
+    migrandoHistorialPar = false;
+  }
+}
+
+/* Historial de conteos (para Consumo). Se guarda en segundo plano y solo sube la fila
+   de HOY. Si se cuenta por áreas en varios guardados el mismo día, queda la foto más
+   reciente (la más completa) — así ese día no cuenta varias veces en los promedios. */
 async function appendHistorial(items, fecha) {
   try {
     const entrada = {
@@ -316,11 +453,8 @@ async function appendHistorial(items, fecha) {
         proveedor: i.proveedor, area: i.area, parLevel: i.parLevel, stockActual: i.stockActual,
       })),
     };
-    await guardarMezclando("historial_conteos_v2", (base) => {
-      let hist = Array.isArray(base) ? [...base, entrada] : [entrada];
-      if (hist.length > 30) hist = hist.slice(hist.length - 30);
-      return hist;
-    });
+    await guardarEntradaHistorialPar(entrada);
+    podarHistorialPar();
   } catch (e) {
     /* no bloquea el guardado del conteo si el historial falla */
   }
@@ -391,8 +525,32 @@ export default function Par() {
   const [toast, setToast] = useState("");
   const [showRespaldo, setShowRespaldo] = useState(false);
   const toastTimer = useRef(null);
+  // Qué áreas ya avanzaron / terminaron su conteo esta semana (guardado aparte del catálogo).
+  const [estadoAreas, setEstadoAreas] = useState({});
 
-  useEffect(() => { load(); }, []);
+  useEffect(() => { load(); recargarEstadoAreas(); }, []);
+
+  async function recargarEstadoAreas() {
+    try {
+      const v = await kvGet(ESTADO_AREAS_KEY);
+      setEstadoAreas(v || {});
+    } catch (e) { /* se queda lo que había */ }
+  }
+
+  // Igual que en DÍA: se aplica SOLO el cambio de esta pantalla sobre lo más reciente del
+  // servidor, para que dos teléfonos marcando áreas distintas no se pisen.
+  async function persistEstadoAreas(aplicar) {
+    const aplicarPodado = (base) => podarSemanas(aplicar(base || {}));
+    setEstadoAreas((prev) => aplicarPodado(prev));
+    const res = await guardarMezclando(ESTADO_AREAS_KEY, aplicarPodado);
+    if (res.ok) {
+      setEstadoAreas(res.value || {});
+      return res;
+    }
+    showToast("No se pudo guardar el estado del área: " + (res.error?.message || "intenta de nuevo"));
+    recargarEstadoAreas();
+    return res;
+  }
 
   function showToast(msg) {
     setToast(msg);
@@ -414,6 +572,8 @@ export default function Par() {
           migrarFotosEmbebidas(value, "par_items_v2", "kv_store", "par")
             .then((aplicarEnPantalla) => { if (aplicarEnPantalla) setItems((prev) => (prev ? aplicarEnPantalla(prev) : prev)); })
             .catch(() => {});
+          // Historial viejo (un solo bloque de ~1.6 MB) → una fila por día, en segundo plano.
+          migrarHistorialParLegado();
         } else {
           const fecha = new Date().toISOString();
           await kvSet("par_items_v2", SEED_ITEMS);
@@ -490,7 +650,16 @@ export default function Par() {
       <Header onRespaldo={() => setShowRespaldo(true)} />
 
       <main className="flex-1 overflow-y-auto pb-24" style={{ maxWidth: 640, margin: "0 auto", width: "100%" }}>
-        {tab === "conteo" && <ConteoTab items={items} onSave={persist} showToast={showToast} />}
+        {tab === "conteo" && (
+          <ConteoTab
+            items={items}
+            onSave={persist}
+            showToast={showToast}
+            estadoAreas={estadoAreas}
+            onSaveEstadoAreas={persistEstadoAreas}
+            onRecargarEstado={recargarEstadoAreas}
+          />
+        )}
         {tab === "inventario" && <InventarioTab items={items} onSave={persist} showToast={showToast} />}
         {tab === "lista" && <ListaTab items={items} onSave={persist} showToast={showToast} />}
         {tab === "consumo" && <ConsumoTab items={items} />}
@@ -822,7 +991,7 @@ function BottomNav({ tab, setTab, items }) {
 }
 
 /* ---------- CONTEO TAB ---------- */
-function ConteoTab({ items, onSave, showToast }) {
+function ConteoTab({ items, onSave, showToast, estadoAreas, onSaveEstadoAreas, onRecargarEstado }) {
   // `draft` guarda SOLO lo tecleado que todavía no se guarda ({ idProducto: cantidad }),
   // respaldado en el teléfono (solo del día) por si se cierra o recarga la app. Antes era
   // una copia de todo el catálogo que se reiniciaba al llegar datos nuevos y borraba lo
@@ -843,13 +1012,24 @@ function ConteoTab({ items, onSave, showToast }) {
   const [historialDia, setHistorialDia] = useState(null);
   const [guardando, setGuardando] = useState(false);
   const [guardado, setGuardado] = useState(false);
+  const [confirmFinalizar, setConfirmFinalizar] = useState(false);
+  const [confirmReabrir, setConfirmReabrir] = useState(false);
+  const [reabriendo, setReabriendo] = useState(false);
 
   const cambiosPendientes = items.filter((i) => draft[i.id] !== undefined && draft[i.id] !== i.stockActual);
   const hayCambios = cambiosPendientes.length > 0;
+  const semana = semanaDe();
 
   useEffect(() => {
     (async () => setHistorialDia(await cargarHistorialDia()))();
   }, []);
+
+  // Al abrir la lista de áreas se trae el estado más reciente (por si otro teléfono
+  // terminó un área mientras tanto).
+  useEffect(() => {
+    if ((areaActual === null || cambiandoArea) && onRecargarEstado) onRecargarEstado();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [areaActual, cambiandoArea]);
 
   function teoricoDe(item) {
     if (!historialDia) return null;
@@ -912,13 +1092,20 @@ function ConteoTab({ items, onSave, showToast }) {
     return map;
   }, [itemsDelArea, query]);
 
+  // Solo las áreas reales (no "todas" / "sin área", que son vistas de encargado) llevan
+  // estado semanal y bloqueo al terminar.
+  const esAreaReal = !!areaActual && areaActual !== "__todas__" && areaActual !== "__sinArea__";
+  const estadoArea = esAreaReal ? estadoDeArea(estadoAreas, semana, areaActual) : null;
+  const finalizada = !!estadoArea?.terminada;
+
   function setVal(id, val) {
+    if (finalizada) return; // área terminada: bloqueada hasta "Corregir conteo"
     const num = Math.max(0, val);
     setDraft((d) => ({ ...d, [id]: num }));
     setGuardado(false);
   }
 
-  async function guardar() {
+  async function guardar(finalizar = false) {
     if (guardandoRef.current) return; // candado contra doble toque
     guardandoRef.current = true;
     setGuardando(true);
@@ -926,26 +1113,82 @@ function ConteoTab({ items, onSave, showToast }) {
       const fecha = new Date().toISOString();
       const cambios = {};
       cambiosPendientes.forEach((i) => { cambios[i.id] = draft[i.id]; });
-      if (Object.keys(cambios).length === 0) return;
-      // Solo se marca "última actualización" en lo que de verdad se contó ahora.
-      const res = await onSave((base) => base.map((i) =>
-        Object.prototype.hasOwnProperty.call(cambios, i.id) && cambios[i.id] !== i.stockActual
-          ? { ...i, stockActual: cambios[i.id], ultimaActualizacion: fecha }
-          : i
-      ));
-      if (!res?.ok) return; // onSave ya avisó; lo tecleado sigue en pantalla para reintentar
-      setDraft((d) => {
-        const n = { ...d };
-        Object.keys(cambios).forEach((id) => { if (n[id] === cambios[id]) delete n[id]; });
-        return n;
-      });
-      appendHistorial(Array.isArray(res.value) ? res.value : items, fecha); // en segundo plano
+      const hayQueGuardar = Object.keys(cambios).length > 0;
+      if (!hayQueGuardar && !(finalizar && esAreaReal)) return;
+
+      if (hayQueGuardar) {
+        // Solo se marca "última actualización" en lo que de verdad se contó ahora.
+        const res = await onSave((base) => base.map((i) =>
+          Object.prototype.hasOwnProperty.call(cambios, i.id) && cambios[i.id] !== i.stockActual
+            ? { ...i, stockActual: cambios[i.id], ultimaActualizacion: fecha }
+            : i
+        ));
+        if (!res?.ok) return; // onSave ya avisó; lo tecleado sigue en pantalla para reintentar
+        setDraft((d) => {
+          const n = { ...d };
+          Object.keys(cambios).forEach((id) => { if (n[id] === cambios[id]) delete n[id]; });
+          return n;
+        });
+        appendHistorial(Array.isArray(res.value) ? res.value : items, fecha); // en segundo plano
+      }
+
+      // Constancia de que el área avanzó / terminó su conteo esta semana.
+      if (esAreaReal && onSaveEstadoAreas) {
+        const area = areaActual;
+        const sem = semana;
+        const r = await onSaveEstadoAreas((base) => {
+          const prev = base?.[sem]?.[area] || {};
+          return {
+            ...(base || {}),
+            [sem]: {
+              ...(base?.[sem] || {}),
+              [area]: {
+                finalizado: !!finalizar || !!prev.finalizado,
+                finalizadoEn: finalizar ? fecha : (prev.finalizadoEn || null),
+                actualizadoEn: fecha,
+              },
+            },
+          };
+        });
+        if (finalizar && !r?.ok) return; // ya avisó; el área sigue abierta para reintentar
+      }
+
       setGuardado(true);
-      showToast("Conteo guardado");
+      setConfirmFinalizar(false);
+      showToast(finalizar ? "Conteo de la semana terminado" : "Avance guardado");
     } finally {
       guardandoRef.current = false;
       setGuardando(false);
     }
+  }
+
+  async function reabrir() {
+    if (!esAreaReal || !onSaveEstadoAreas) { setConfirmReabrir(false); return; }
+    setReabriendo(true);
+    const area = areaActual;
+    const sem = semana;
+    const r = await onSaveEstadoAreas((base) => ({
+      ...(base || {}),
+      [sem]: {
+        ...(base?.[sem] || {}),
+        [area]: { ...(base?.[sem]?.[area] || {}), finalizado: false },
+      },
+    }));
+    setReabriendo(false);
+    setConfirmReabrir(false);
+    setGuardado(false);
+    if (r?.ok) showToast("Conteo reabierto para corregir");
+  }
+
+  async function reiniciarSemana() {
+    if (!onSaveEstadoAreas) return;
+    const sem = semana;
+    const r = await onSaveEstadoAreas((base) => {
+      const n = { ...(base || {}) };
+      delete n[sem];
+      return n;
+    });
+    if (r?.ok) showToast("Semana reiniciada: todas las áreas en «sin iniciar»");
   }
 
   if (areaActual === undefined) {
@@ -963,6 +1206,9 @@ function ConteoTab({ items, onSave, showToast }) {
         sinArea={sinArea}
         onElegir={elegirArea}
         onCancelar={areaActual && cambiandoArea ? () => setCambiandoArea(false) : null}
+        estadoAreas={estadoAreas}
+        semana={semana}
+        onReiniciarSemana={reiniciarSemana}
       />
     );
   }
@@ -978,7 +1224,7 @@ function ConteoTab({ items, onSave, showToast }) {
       <button
         onClick={() => setCambiandoArea(true)}
         className="w-full flex items-center justify-between px-4 py-3 mb-3 rounded-xl"
-        style={{ background: C.accent, color: "#fff" }}
+        style={{ background: finalizada ? C.ok : C.accent, color: "#fff" }}
       >
         <div className="text-left">
           <div style={{ fontSize: 13, fontWeight: 600 }}>Contando: {nombreAreaActual}</div>
@@ -988,6 +1234,46 @@ function ConteoTab({ items, onSave, showToast }) {
         </div>
         <span style={{ fontSize: 12, textDecoration: "underline" }}>Cambiar área</span>
       </button>
+
+      {esAreaReal && (
+        <div
+          className="flex items-center justify-between gap-2 px-4 py-3 mb-3 rounded-xl"
+          style={{ background: estadoArea.bg, border: `1px solid ${estadoArea.color}` }}
+        >
+          <div className="flex items-center gap-2 min-w-0">
+            {finalizada
+              ? <Lock size={15} style={{ color: C.ok, flexShrink: 0 }} />
+              : estadoArea.enProgreso
+                ? <Loader2 size={15} style={{ color: C.warn, flexShrink: 0 }} />
+                : <X size={15} style={{ color: C.critical, flexShrink: 0 }} />}
+            <div className="min-w-0">
+              <div style={{ fontSize: 12.5, fontWeight: 600, color: estadoArea.color }}>
+                {finalizada ? "Conteo de la semana terminado" : estadoArea.enProgreso ? "Conteo en progreso" : "Conteo sin iniciar esta semana"}
+              </div>
+              <div style={{ fontSize: 10.5, color: C.inkSoft }}>
+                Semana {nombreSemana(semana)}
+                {finalizada && estadoArea.e?.finalizadoEn ? ` · terminado ${formatFecha(estadoArea.e.finalizadoEn)}` : ""}
+                {!finalizada && estadoArea.enProgreso && estadoArea.e?.actualizadoEn ? ` · último avance ${formatFecha(estadoArea.e.actualizadoEn)}` : ""}
+              </div>
+            </div>
+          </div>
+          {finalizada && (
+            <button
+              onClick={() => setConfirmReabrir(true)}
+              className="px-3 py-1.5 rounded-lg flex-shrink-0"
+              style={{ background: C.paper, border: `1px solid ${C.ok}`, color: C.ok, fontSize: 12, fontWeight: 600 }}
+            >
+              Corregir conteo
+            </button>
+          )}
+        </div>
+      )}
+
+      {hayCambios && !guardando && (
+        <div className="flex items-center gap-1.5 mb-2.5 px-3 py-2 rounded-xl" style={{ background: C.warnBg, color: C.warn, fontSize: 12, fontWeight: 600 }}>
+          <AlertTriangle size={13} /> {cambiosPendientes.length} producto{cambiosPendientes.length === 1 ? "" : "s"} sin guardar
+        </div>
+      )}
 
       <div className="relative mb-3">
         <Search size={16} style={{ position: "absolute", left: 12, top: 12, color: C.inkSoft }} />
@@ -1042,8 +1328,9 @@ function ConteoTab({ items, onSave, showToast }) {
                     <div className="flex items-center gap-1.5">
                       <button
                         onClick={() => setVal(item.id, roundStep(val, item.unidad, -1))}
+                        disabled={finalizada}
                         className="w-7 h-7 rounded-full flex items-center justify-center"
-                        style={{ background: C.bg, border: `1px solid ${C.line}` }}
+                        style={{ background: C.bg, border: `1px solid ${C.line}`, opacity: finalizada ? 0.4 : 1 }}
                       >
                         <Minus size={13} />
                       </button>
@@ -1052,16 +1339,18 @@ function ConteoTab({ items, onSave, showToast }) {
                         inputMode="decimal"
                         value={val}
                         onChange={(e) => setVal(item.id, parseFloat(e.target.value) || 0)}
+                        disabled={finalizada}
                         className="text-center rounded-lg py-1"
                         style={{
                           width: 56, fontFamily: "'IBM Plex Mono', monospace", fontWeight: 600, fontSize: 14,
-                          border: `1px solid ${C.line}`, background: s.bg, color: s.color,
+                          border: `1px solid ${C.line}`, background: s.bg, color: s.color, opacity: finalizada ? 0.6 : 1,
                         }}
                       />
                       <button
                         onClick={() => setVal(item.id, roundStep(val, item.unidad, 1))}
+                        disabled={finalizada}
                         className="w-7 h-7 rounded-full flex items-center justify-center"
-                        style={{ background: C.bg, border: `1px solid ${C.line}` }}
+                        style={{ background: C.bg, border: `1px solid ${C.line}`, opacity: finalizada ? 0.4 : 1 }}
                       >
                         <Plus size={13} />
                       </button>
@@ -1100,9 +1389,33 @@ function ConteoTab({ items, onSave, showToast }) {
         </p>
       )}
 
-      {(hayCambios || guardando) && (
+      {esAreaReal && !finalizada && itemsDelArea.length > 0 && (
+        <div className="fixed left-1/2 flex items-center gap-2" style={{ bottom: 76, transform: "translateX(-50%)" }}>
+          {(hayCambios || guardando) && (
+            <button
+              onClick={() => guardar(false)}
+              disabled={guardando}
+              className="flex items-center gap-1.5 px-4 py-3 rounded-full shadow-lg"
+              style={{ background: C.paper, border: `1px solid ${C.accent}`, color: C.accent, fontWeight: 600, fontSize: 13, opacity: guardando ? 0.85 : 1, whiteSpace: "nowrap" }}
+            >
+              {guardando ? <Loader2 size={15} className="animate-spin" /> : <Save size={15} />}
+              {guardando ? "Guardando..." : "Guardar avance"}
+            </button>
+          )}
+          <button
+            onClick={() => setConfirmFinalizar(true)}
+            disabled={guardando}
+            className="flex items-center gap-1.5 px-4 py-3 rounded-full shadow-lg"
+            style={{ background: C.accent, color: "#fff", fontWeight: 600, fontSize: 13, opacity: guardando ? 0.85 : 1, whiteSpace: "nowrap" }}
+          >
+            <Check size={15} /> Terminar conteo
+          </button>
+        </div>
+      )}
+
+      {!esAreaReal && (hayCambios || guardando) && (
         <button
-          onClick={guardar}
+          onClick={() => guardar(false)}
           disabled={guardando}
           className="fixed left-1/2 flex items-center gap-2 px-5 py-3 rounded-full shadow-lg"
           style={{ bottom: 76, transform: "translateX(-50%)", background: C.accent, color: "#fff", fontWeight: 600, fontSize: 14, opacity: guardando ? 0.85 : 1 }}
@@ -1111,7 +1424,28 @@ function ConteoTab({ items, onSave, showToast }) {
           {guardando ? "Guardando..." : "Guardar conteo"}
         </button>
       )}
-      {guardado && !hayCambios && (
+
+      {confirmFinalizar && (
+        <ConfirmAccion
+          text={`¿Terminar el conteo de ${nombreAreaActual} de esta semana?${hayCambios ? " Se guardará lo que llevas contado." : ""} El área quedará en verde y bloqueada para editar. Si hace falta, después puedes usar «Corregir conteo» para volver a abrirla.`}
+          confirmLabel="Terminar conteo"
+          confirmColor={C.accent}
+          onCancel={() => setConfirmFinalizar(false)}
+          onConfirm={() => guardar(true)}
+        />
+      )}
+
+      {confirmReabrir && (
+        <ConfirmAccion
+          text="¿Corregir el conteo de esta área? Se desbloqueará para que puedas editarla de nuevo."
+          confirmLabel={reabriendo ? "Reabriendo..." : "Corregir conteo"}
+          confirmColor={C.warn}
+          onCancel={() => setConfirmReabrir(false)}
+          onConfirm={reabrir}
+        />
+      )}
+
+      {!esAreaReal && guardado && !hayCambios && (
         <div
           className="fixed left-1/2 flex items-center gap-2 px-5 py-3 rounded-full shadow-lg"
           style={{ bottom: 76, transform: "translateX(-50%)", background: C.ok, color: "#fff", fontWeight: 600, fontSize: 14 }}
@@ -1123,26 +1457,70 @@ function ConteoTab({ items, onSave, showToast }) {
   );
 }
 
-function AreaPicker({ areas, sinArea, onElegir, onCancelar }) {
+function AreaPicker({ areas, sinArea, onElegir, onCancelar, estadoAreas, semana, onReiniciarSemana }) {
+  const [confirmReiniciar, setConfirmReiniciar] = useState(false);
+  const [reiniciando, setReiniciando] = useState(false);
+  const terminadas = areas.filter((a) => estadoDeArea(estadoAreas, semana, a).terminada).length;
+  const hayAvance = areas.some((a) => estadoAreas?.[semana]?.[a]);
+  const todas = areas.length > 0 && terminadas === areas.length;
+
   return (
-    <div className="px-5 pt-8">
-      <div className="text-center mb-6">
+    <div className="px-5 pt-8 pb-6">
+      <div className="text-center mb-5">
         <h2 style={{ fontFamily: "'Space Grotesk', sans-serif", fontWeight: 700, fontSize: 20 }}>¿En qué área trabajas?</h2>
         <p style={{ fontSize: 13, color: C.inkSoft, marginTop: 4 }}>Elige tu área para ver solo lo que te toca contar.</p>
       </div>
 
+      {areas.length > 0 && (
+        <div
+          className="flex items-center justify-between gap-3 px-4 py-3 mb-3 rounded-xl"
+          style={{ background: todas ? C.okBg : C.paper, border: `1px solid ${todas ? C.ok : C.line}` }}
+        >
+          <div className="min-w-0">
+            <div style={{ fontSize: 12.5, fontWeight: 600, color: todas ? C.ok : C.ink }}>
+              {todas ? "Conteo semanal completo" : `${terminadas} de ${areas.length} áreas terminadas`}
+            </div>
+            <div style={{ fontSize: 10.5, color: C.inkSoft }}>Semana {nombreSemana(semana)}</div>
+          </div>
+          <div className="flex gap-1 flex-shrink-0">
+            {areas.map((a) => (
+              <span key={a} className="rounded-full" title={a} style={{ width: 9, height: 9, background: estadoDeArea(estadoAreas, semana, a).color }} />
+            ))}
+          </div>
+        </div>
+      )}
+
       <div className="flex flex-col gap-2.5">
-        {areas.map((a) => (
-          <button
-            key={a}
-            onClick={() => onElegir(a)}
-            className="w-full py-4 rounded-2xl text-left px-5 flex items-center justify-between"
-            style={{ background: C.paper, border: `1px solid ${C.line}` }}
-          >
-            <span style={{ fontWeight: 600, fontSize: 15 }}>{a}</span>
-            <ChevronRight size={18} style={{ color: C.inkSoft }} />
-          </button>
-        ))}
+        {areas.map((a) => {
+          const st = estadoDeArea(estadoAreas, semana, a);
+          return (
+            <button
+              key={a}
+              onClick={() => onElegir(a)}
+              className="w-full py-4 rounded-2xl text-left px-5 flex items-center justify-between"
+              style={{ background: C.paper, border: `1.5px solid ${st.color}` }}
+            >
+              <div className="min-w-0 flex items-center gap-2.5">
+                <span className="rounded-full flex-shrink-0" style={{ width: 9, height: 9, background: st.color }} />
+                <div className="min-w-0">
+                  <span style={{ fontWeight: 600, fontSize: 15 }}>{a}</span>
+                  {st.terminada && (
+                    <div className="flex items-center gap-1 mt-0.5" style={{ fontSize: 11, color: C.ok, fontWeight: 600 }}>
+                      <Lock size={11} /> Conteo terminado{st.e?.finalizadoEn ? ` · ${formatFecha(st.e.finalizadoEn)}` : ""}
+                    </div>
+                  )}
+                  {st.enProgreso && (
+                    <div style={{ fontSize: 11, color: C.warn, fontWeight: 600, marginTop: 2 }}>En progreso</div>
+                  )}
+                  {!st.terminada && !st.enProgreso && (
+                    <div style={{ fontSize: 11, color: C.critical, fontWeight: 600, marginTop: 2 }}>Sin iniciar</div>
+                  )}
+                </div>
+              </div>
+              <ChevronRight size={18} style={{ color: C.inkSoft, flexShrink: 0 }} />
+            </button>
+          );
+        })}
 
         {sinArea && (
           <button
@@ -1168,6 +1546,47 @@ function AreaPicker({ areas, sinArea, onElegir, onCancelar }) {
             Cancelar
           </button>
         )}
+
+        {hayAvance && onReiniciarSemana && (
+          <button
+            onClick={() => setConfirmReiniciar(true)}
+            disabled={reiniciando}
+            className="w-full py-2.5 mt-2 rounded-xl flex items-center justify-center gap-1.5"
+            style={{ border: `1px solid ${C.critical}`, color: C.critical, background: C.paper, fontSize: 12.5, fontWeight: 600 }}
+          >
+            {reiniciando ? <Loader2 size={13} className="animate-spin" /> : <RotateCcw size={13} />}
+            {reiniciando ? "Reiniciando..." : "Reiniciar semana"}
+          </button>
+        )}
+      </div>
+
+      {confirmReiniciar && (
+        <ConfirmAccion
+          text="¿Reiniciar la semana? Todas las áreas vuelven a «sin iniciar» y se desbloquean. Las cantidades contadas y el inventario NO se borran."
+          confirmLabel="Reiniciar semana"
+          confirmColor={C.critical}
+          onCancel={() => setConfirmReiniciar(false)}
+          onConfirm={async () => {
+            setConfirmReiniciar(false);
+            setReiniciando(true);
+            await onReiniciarSemana();
+            setReiniciando(false);
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+function ConfirmAccion({ text, confirmLabel, confirmColor, onCancel, onConfirm }) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center px-6" style={{ background: "rgba(34,31,26,0.45)" }} onClick={onCancel}>
+      <div className="w-full rounded-2xl p-5" style={{ background: C.paper, maxWidth: 340 }} onClick={(e) => e.stopPropagation()}>
+        <p style={{ fontSize: 14, marginBottom: 16 }}>{text}</p>
+        <div className="flex gap-2">
+          <button onClick={onCancel} className="flex-1 py-2.5 rounded-xl text-sm font-medium" style={{ border: `1px solid ${C.line}` }}>Cancelar</button>
+          <button onClick={onConfirm} className="flex-1 py-2.5 rounded-xl text-sm font-semibold" style={{ background: confirmColor || C.accent, color: "#fff" }}>{confirmLabel || "Confirmar"}</button>
+        </div>
       </div>
     </div>
   );
@@ -1535,6 +1954,14 @@ function ListaTab({ items, onSave, showToast }) {
     guardarChecked({ ...checked, [id]: false });
   }
 
+  // "Omitir": se tacha de la lista SIN sumar nada al inventario (no se compró ni se
+  // produjo esta vez). Se distingue de "comprado" y se puede deshacer tocándolo otra vez.
+  function omitir(item) {
+    setComprando(null);
+    guardarChecked({ ...checked, [item.id]: "omitido" });
+    showToast(`${item.nombre}: omitido de esta lista (no se sumó nada al inventario).`);
+  }
+
   async function registrarCompra(itemConsolidado, cantidadComprada) {
     setComprando(null);
     const k = itemConsolidado.id;
@@ -1567,7 +1994,9 @@ function ListaTab({ items, onSave, showToast }) {
     return map;
   }, [necesarios]);
 
-  const comprados = necesarios.filter((i) => checked[i.id]).length;
+  const comprados = necesarios.filter((i) => checked[i.id] === true).length;
+  const omitidos = necesarios.filter((i) => checked[i.id] === "omitido").length;
+  const resueltos = comprados + omitidos;
 
   if (necesarios.length === 0) {
     return (
@@ -1593,7 +2022,10 @@ function ListaTab({ items, onSave, showToast }) {
           <span style={{ fontWeight: 600, fontSize: 13 }}>LISTA DE COMPRAS</span>
           <span style={{ fontSize: 11, color: C.inkSoft }}>{fechaConteo ? formatFecha(fechaConteo) : new Date().toLocaleDateString("es-MX")}</span>
         </div>
-        <div style={{ fontSize: 11, color: C.inkSoft }}>{comprados}/{necesarios.length} comprados</div>
+        <div style={{ fontSize: 11, color: C.inkSoft }}>
+          {resueltos}/{necesarios.length} resueltos · {comprados} comprado{comprados === 1 ? "" : "s"}
+          {omitidos > 0 ? ` · ${omitidos} omitido${omitidos === 1 ? "" : "s"}` : ""}
+        </div>
       </div>
 
       {Object.entries(porProveedor).map(([prov, list]) => (
@@ -1606,6 +2038,8 @@ function ListaTab({ items, onSave, showToast }) {
               const status = statusOf(item);
               const s = STATUS_STYLE[status];
               const isChecked = !!checked[item.id];
+              const isOmitido = checked[item.id] === "omitido";
+              const colorMarca = isOmitido ? C.inkSoft : C.accent;
               return (
                 <button
                   key={item.id}
@@ -1615,16 +2049,22 @@ function ListaTab({ items, onSave, showToast }) {
                 >
                   <div
                     className="w-5 h-5 rounded-md flex items-center justify-center flex-shrink-0"
-                    style={{ border: `1.5px solid ${isChecked ? C.accent : C.line}`, background: isChecked ? C.accent : "transparent" }}
+                    style={{ border: `1.5px solid ${isChecked ? colorMarca : C.line}`, background: isChecked ? colorMarca : "transparent" }}
                   >
-                    {isChecked && <Check size={13} color="#fff" />}
+                    {isChecked && (isOmitido ? <X size={13} color="#fff" /> : <Check size={13} color="#fff" />)}
                   </div>
                   <div className="flex-1 min-w-0">
                     <div style={{ fontSize: 14, fontWeight: 500, textDecoration: isChecked ? "line-through" : "none" }}>{item.nombre}</div>
                     <div className="flex items-center gap-1.5 mt-0.5 flex-wrap">
-                      <span className="px-1.5 py-0.5 rounded" style={{ fontSize: 10, background: s.bg, color: s.color, fontFamily: "'IBM Plex Mono', monospace" }}>
-                        {s.label}
-                      </span>
+                      {isOmitido ? (
+                        <span className="px-1.5 py-0.5 rounded" style={{ fontSize: 10, background: C.bg, color: C.inkSoft, border: `1px solid ${C.line}`, fontFamily: "'IBM Plex Mono', monospace" }}>
+                          Omitido
+                        </span>
+                      ) : (
+                        <span className="px-1.5 py-0.5 rounded" style={{ fontSize: 10, background: s.bg, color: s.color, fontFamily: "'IBM Plex Mono', monospace" }}>
+                          {s.label}
+                        </span>
+                      )}
                       <span style={{ fontSize: 11, color: C.inkSoft, fontFamily: "'IBM Plex Mono', monospace" }}>
                         hay {fmtNum(item.stockActual)} / par {fmtNum(item.parLevel)}
                       </span>
@@ -1646,13 +2086,13 @@ function ListaTab({ items, onSave, showToast }) {
       ))}
 
       {comprando && (
-        <ComprarModal item={comprando} onCancelar={() => setComprando(null)} onConfirmar={registrarCompra} />
+        <ComprarModal item={comprando} onCancelar={() => setComprando(null)} onConfirmar={registrarCompra} onOmitir={omitir} />
       )}
     </div>
   );
 }
 
-function ComprarModal({ item, onCancelar, onConfirmar }) {
+function ComprarModal({ item, onCancelar, onConfirmar, onOmitir }) {
   const [cantidad, setCantidad] = useState(String(item.faltante));
 
   return (
@@ -1689,6 +2129,20 @@ function ComprarModal({ item, onCancelar, onConfirmar }) {
         >
           Registrar entrada al inventario
         </button>
+        {onOmitir && (
+          <button
+            onClick={() => onOmitir(item)}
+            className="w-full py-3 mt-2 rounded-xl font-semibold text-sm flex items-center justify-center gap-1.5"
+            style={{ background: C.paper, border: `1px solid ${C.line}`, color: C.inkSoft }}
+          >
+            <X size={15} /> Omitir esta vez (no se compró)
+          </button>
+        )}
+        {onOmitir && (
+          <p style={{ fontSize: 10.5, color: C.inkSoft, marginTop: 6, textAlign: "center" }}>
+            Omitir lo tacha de la lista sin sumar nada al inventario.
+          </p>
+        )}
       </div>
     </div>
   );
@@ -1705,7 +2159,7 @@ function ConsumoTab({ items }) {
   useEffect(() => {
     (async () => {
       try {
-        const val = await kvGet("historial_conteos_v2");
+        const val = await leerHistorialPorDia(HIST_PAR_PREFIJO, HIST_PAR_LEGADO, "kv_store", HIST_PAR_MAX);
         setHistorial(val || []);
       } catch (e) {
         setHistorial([]);
