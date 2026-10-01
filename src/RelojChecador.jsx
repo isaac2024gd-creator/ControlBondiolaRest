@@ -848,7 +848,8 @@ function buildTicketPropinasEscPos(t, ancho, businessConfig, modoEntrega) {
   const center = (on) => cmd(0x1b, 0x61, on ? 1 : 0);
   // todo el ticket va en negritas (y doble pasada) para que se lea bien en papel térmico chico
   const bold = () => cmd(0x1b, 0x45, 1, 0x1b, 0x47, 1);
-  const big = (on) => cmd(0x1d, 0x21, on ? 0x11 : 0x00);
+  // letra al doble de alto (mismo ancho, así no cambia cuántas letras caben por línea)
+  const alto = (on) => cmd(0x1d, 0x21, on ? 0x01 : 0x00);
   const sep = () => line("-".repeat(cols));
   const wrap = (s) => {
     const words = textoTicket(s).split(/\s+/).filter(Boolean);
@@ -897,13 +898,17 @@ function buildTicketPropinasEscPos(t, ancho, businessConfig, modoEntrega) {
   cmd(0x1b, 0x40); // reiniciar impresora
   center(true);
   bold(true);
+  alto(true);
   wrap(businessConfig?.nombre || "Restaurante").forEach((l) => line(l));
+  alto(false);
   bold(false);
   if (businessConfig?.sucursal) wrap(businessConfig.sucursal).forEach((l) => line(l));
   if (businessConfig?.direccion) wrap(businessConfig.direccion).forEach((l) => line(l));
   sep();
   bold(true);
+  alto(true);
   line("COMPROBANTE DE PROPINAS");
+  alto(false);
   bold(false);
   line("Folio " + String(t.id || "").slice(-6).toUpperCase());
   center(false);
@@ -917,7 +922,9 @@ function buildTicketPropinasEscPos(t, ancho, businessConfig, modoEntrega) {
   line("Impreso: " + fFechaHora(new Date()));
   sep();
   bold(true);
+  alto(true);
   row("TOTAL PROPINAS", dinero(t.monto));
+  alto(false);
   bold(false);
   row(`Repartido (${conPropina.length} pers.)`, dinero(repartido));
   if (sobrante > 0) row("Sobrante (redondeo)", dinero(sobrante));
@@ -930,7 +937,9 @@ function buildTicketPropinasEscPos(t, ancho, businessConfig, modoEntrega) {
   conPropina.forEach((r, i) => {
     line();
     bold(true);
+    alto(true);
     row(r.employeeName, dinero(r.monto));
+    alto(false);
     bold(false);
     line(`${r.diasPropina}/${r.diasTrabajados} dias elegibles${r.tipo === "externo" ? " - externo" : ""}`);
     (r.motivosCorreccion || []).forEach((c) =>
@@ -979,55 +988,141 @@ const SERVICIOS_IMPRESORA_BLE = [
   "49535343-fe7d-4ae5-8fa9-9fafd205e455",
 ];
 let impresoraBle = null; // { device, characteristic } — se recuerda mientras la app siga abierta
+const CLAVE_IMPRESORA_BLE = "impresora_ble_nombre";
+
+function conTiempoLimite(promesa, ms, etiqueta) {
+  return Promise.race([
+    promesa,
+    new Promise((_, rej) => setTimeout(() => rej(Object.assign(new Error(etiqueta), { name: "TimeoutError" })), ms)),
+  ]);
+}
+
+async function abrirConexionImpresora(device) {
+  const gatt = await conTiempoLimite(device.gatt.connect(), 8000, "CONEXION_TARDADA");
+  const characteristic = await buscarCaracteristicaEscritura(gatt);
+  if (!device.__escuchaDesconexion) {
+    device.__escuchaDesconexion = true;
+    // si la impresora se apaga o se duerme, se marca para reconectar en la siguiente impresión
+    device.addEventListener("gattserverdisconnected", () => {
+      if (impresoraBle?.device === device) impresoraBle.characteristic = null;
+    });
+  }
+  impresoraBle = { device, characteristic };
+  try {
+    localStorage.setItem(CLAVE_IMPRESORA_BLE, device.name || "impresora");
+  } catch {}
+  return impresoraBle;
+}
+
+// nombre de la última impresora usada en este teléfono (para mostrarlo aunque se haya cerrado la app)
+function nombreImpresoraGuardada() {
+  try {
+    return localStorage.getItem(CLAVE_IMPRESORA_BLE) || "";
+  } catch {
+    return "";
+  }
+}
 
 async function conectarImpresoraBle(forzarNueva) {
   if (!forzarNueva && impresoraBle?.device?.gatt) {
     try {
-      if (!impresoraBle.device.gatt.connected) {
-        await impresoraBle.device.gatt.connect();
-        impresoraBle.characteristic = await buscarCaracteristicaEscritura(impresoraBle.device.gatt);
-      }
-      return impresoraBle;
+      if (impresoraBle.device.gatt.connected && impresoraBle.characteristic) return impresoraBle;
+      return await abrirConexionImpresora(impresoraBle.device);
     } catch {
       impresoraBle = null;
     }
+  }
+  // si el navegador ya tiene permiso guardado de una impresora usada antes, reconecta sin preguntar
+  if (!forzarNueva && navigator.bluetooth.getDevices) {
+    try {
+      const guardada = nombreImpresoraGuardada();
+      const conocidos = await navigator.bluetooth.getDevices();
+      const candidata = conocidos.find((d) => guardada && d.name === guardada) || (conocidos.length === 1 ? conocidos[0] : null);
+      if (candidata) return await abrirConexionImpresora(candidata);
+    } catch {}
   }
   const device = await navigator.bluetooth.requestDevice({
     acceptAllDevices: true,
     optionalServices: SERVICIOS_IMPRESORA_BLE,
   });
-  const gatt = await device.gatt.connect();
-  const characteristic = await buscarCaracteristicaEscritura(gatt);
-  impresoraBle = { device, characteristic };
-  return impresoraBle;
+  return await abrirConexionImpresora(device);
+}
+
+function olvidarImpresoraBle() {
+  try {
+    impresoraBle?.device?.gatt?.connected && impresoraBle.device.gatt.disconnect();
+  } catch {}
+  impresoraBle = null;
+  try {
+    localStorage.removeItem(CLAVE_IMPRESORA_BLE);
+  } catch {}
 }
 
 async function buscarCaracteristicaEscritura(gatt) {
   const services = await gatt.getPrimaryServices();
-  for (const sv of services) {
+  // primero los servicios conocidos de impresoras, luego cualquier otro
+  const orden = [...services].sort(
+    (a, b) => (SERVICIOS_IMPRESORA_BLE.includes(a.uuid) ? 0 : 1) - (SERVICIOS_IMPRESORA_BLE.includes(b.uuid) ? 0 : 1)
+  );
+  for (const sv of orden) {
     let chars = [];
     try {
       chars = await sv.getCharacteristics();
     } catch {
       continue;
     }
-    const c = chars.find((ch) => ch.properties.writeWithoutResponse || ch.properties.write);
+    const c = chars.find((ch) => ch.properties.writeWithoutResponse) || chars.find((ch) => ch.properties.write);
     if (c) return c;
   }
   throw new Error("SIN_CARACTERISTICA");
 }
 
-async function imprimirPorBluetooth(bytes, forzarNueva = false) {
-  const { characteristic } = await conectarImpresoraBle(forzarNueva);
+async function enviarBytesImpresora(characteristic, bytes) {
   const sinRespuesta = characteristic.properties.writeWithoutResponse;
-  const TAM = 100;
+  // Bluetooth BLE solo garantiza 20 bytes por envío: con trozos más grandes muchas impresoras
+  // baratas cortan el texto o imprimen basura. Más lento, pero siempre sale completo.
+  const TAM = 20;
   for (let i = 0; i < bytes.length; i += TAM) {
     const trozo = bytes.slice(i, i + TAM);
     if (sinRespuesta && characteristic.writeValueWithoutResponse) await characteristic.writeValueWithoutResponse(trozo);
     else if (characteristic.writeValueWithResponse) await characteristic.writeValueWithResponse(trozo);
     else await characteristic.writeValue(trozo);
-    await new Promise((r) => setTimeout(r, 25)); // pausa corta para no saturar el búfer de la impresora
+    await new Promise((r) => setTimeout(r, sinRespuesta ? 20 : 5)); // pausa para no saturar el búfer de la impresora
   }
+}
+
+async function imprimirPorBluetooth(bytes, forzarNueva = false) {
+  const { characteristic } = await conectarImpresoraBle(forzarNueva);
+  try {
+    await enviarBytesImpresora(characteristic, bytes);
+  } catch (err) {
+    // la impresora se durmió o se desconectó a medio camino: reconecta una vez y reintenta
+    if (err?.name !== "NetworkError" && err?.name !== "InvalidStateError") throw err;
+    if (impresoraBle) impresoraBle.characteristic = null;
+    const nueva = await conectarImpresoraBle(false);
+    await enviarBytesImpresora(nueva.characteristic, bytes);
+  }
+}
+
+// ticket corto para comprobar que la impresora y el ancho de papel están bien
+function buildTicketPruebaEscPos(ancho, businessConfig) {
+  const cols = ancho === 80 ? 48 : 32;
+  const out = [0x1b, 0x40, 0x1b, 0x61, 1, 0x1b, 0x45, 1];
+  const line = (s = "") => {
+    for (const ch of textoTicket(s)) out.push(ch.charCodeAt(0));
+    out.push(0x0a);
+  };
+  line(businessConfig?.nombre || "Restaurante");
+  line("-".repeat(cols));
+  line("PRUEBA DE IMPRESORA");
+  line(`Papel ${ancho === 80 ? 80 : 58} mm (${cols} letras)`);
+  line("1234567890".repeat(Math.ceil(cols / 10)).slice(0, cols));
+  line(new Date().toLocaleString("es-MX"));
+  line("-".repeat(cols));
+  line("Si esta linea se ve completa,");
+  line("la impresora funciona bien.");
+  out.push(0x0a, 0x0a, 0x0a, 0x0a, 0x1d, 0x56, 0x42, 0x00);
+  return new Uint8Array(out);
 }
 
 // RawBT (app gratuita de Android) imprime por Bluetooth "clásico", que el navegador no puede usar directo
@@ -3020,7 +3115,7 @@ export default function RelojChecador() {
   const ticketRef = useRef(null);
   const [ticketBtEstado, setTicketBtEstado] = useState(null); // { tipo: "info"|"ok"|"error", texto }
   const [ticketBtOcupado, setTicketBtOcupado] = useState(false);
-  async function imprimirTicketDirecto(registro, ancho, forzarNueva = false) {
+  async function imprimirTicketDirecto(registro, ancho, forzarNueva = false, prueba = false) {
     if (ticketBtOcupado) return;
     if (!navigator.bluetooth) {
       setTicketBtEstado({
@@ -3031,11 +3126,22 @@ export default function RelojChecador() {
       return;
     }
     setTicketBtOcupado(true);
-    setTicketBtEstado({ tipo: "info", texto: forzarNueva || !impresoraBle ? "Elige tu impresora en la lista…" : "Imprimiendo…" });
+    setTicketBtEstado({
+      tipo: "info",
+      texto:
+        forzarNueva || (!impresoraBle && !nombreImpresoraGuardada())
+          ? "Elige tu impresora en la lista (suele llamarse MTP, PT-210, MP58, POS, Printer…)"
+          : "Conectando e imprimiendo…",
+    });
     try {
-      const bytes = buildTicketPropinasEscPos(registro, ancho, businessConfig, propinasConfig.modoEntrega);
+      const bytes = prueba
+        ? buildTicketPruebaEscPos(ancho, businessConfig)
+        : buildTicketPropinasEscPos(registro, ancho, businessConfig, propinasConfig.modoEntrega);
       await imprimirPorBluetooth(bytes, forzarNueva);
-      setTicketBtEstado({ tipo: "ok", texto: `Ticket enviado a ${impresoraBle?.device?.name || "la impresora"}.` });
+      setTicketBtEstado({
+        tipo: "ok",
+        texto: `${prueba ? "Prueba enviada" : "Ticket enviado"} a ${impresoraBle?.device?.name || "la impresora"}.`,
+      });
     } catch (err) {
       console.error("Impresión Bluetooth:", err);
       const nombre = err?.name || "";
@@ -3044,7 +3150,11 @@ export default function RelojChecador() {
       else if (err?.message === "SIN_CARACTERISTICA" || nombre === "NotSupportedError")
         texto =
           "Esta impresora no acepta conexión directa desde el navegador (usa Bluetooth clásico). Usa el botón RawBT.";
-      else if (nombre === "SecurityError") texto = "El navegador bloqueó el Bluetooth. Revisa los permisos de Chrome.";
+      else if (nombre === "TimeoutError")
+        texto = "La impresora no respondió. Verifica que esté encendida, cerca y que no esté conectada a otro teléfono.";
+      else if (nombre === "SecurityError")
+        texto =
+          "No se pudo abrir la lista de impresoras. Toca de nuevo el botón; si sigue, revisa que Chrome tenga permiso de Bluetooth y Ubicación.";
       setTicketBtEstado({ tipo: "error", texto });
     } finally {
       setTicketBtOcupado(false);
@@ -4330,7 +4440,7 @@ export default function RelojChecador() {
     const { registro: t, ancho } = propinasTicketView;
     const anchoPapel = ancho === 80 ? 80 : 57;
     const anchoContenido = ancho === 80 ? 72 : 48;
-    const fontPx = ancho === 80 ? 13.5 : 11.5;
+    const fontPx = ancho === 80 ? 15 : 13;
     const inicioT = t.fechaInicio || t.fecha;
     const finT = t.fechaFin || t.fecha;
     const fmtFechaT = (k) => {
@@ -4359,8 +4469,8 @@ export default function RelojChecador() {
             .ticket-area { padding: 0 !important; }
             .ticket { box-shadow: none !important; margin: 0 !important; }
           }
-          .ticket { font-family: 'Courier New', Courier, monospace; color: #000; line-height: 1.3; font-weight: 700; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
-          .ticket, .ticket * { -webkit-text-stroke: 0.25px #000; }
+          .ticket { font-family: 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; font-variant-numeric: tabular-nums; letter-spacing: 0.01em; color: #000; line-height: 1.3; font-weight: 700; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+          .ticket, .ticket * { -webkit-text-stroke: 0.2px #000; }
           .ticket * { box-sizing: border-box; }
           .ticket .c { text-align: center; }
           .ticket .b { font-weight: 900; }
@@ -4390,7 +4500,7 @@ export default function RelojChecador() {
                     : { border: `1px solid ${ink}33`, color: ink }
                 }
               >
-                {w} mm
+                {w === 57 ? 58 : w} mm
               </button>
             ))}
           </div>
@@ -4418,7 +4528,7 @@ export default function RelojChecador() {
               style={{ background: sage, color: paper }}
             >
               {ticketBtOcupado ? <Loader2 size={14} className="animate-spin" /> : <Printer size={14} />}
-              {impresoraBle ? "Imprimir Bluetooth" : "Buscar impresora"}
+              {impresoraBle || nombreImpresoraGuardada() ? "Imprimir Bluetooth" : "Buscar impresora"}
             </button>
             <button
               onClick={() => imprimirPorRawBT(buildTicketPropinasEscPos(t, anchoPapel, businessConfig, propinasConfig.modoEntrega))}
@@ -4428,16 +4538,49 @@ export default function RelojChecador() {
               RawBT
             </button>
           </div>
-          {impresoraBle && (
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+            {(impresoraBle || nombreImpresoraGuardada()) && (
+              <span className="text-[10px] font-bold uppercase" style={{ color: ink + "99" }}>
+                {impresoraBle?.characteristic ? "Conectada" : "Última usada"}:{" "}
+                {impresoraBle?.device?.name || nombreImpresoraGuardada() || "impresora"}
+              </span>
+            )}
             <button
-              onClick={() => imprimirTicketDirecto(t, anchoPapel, true)}
+              onClick={() => imprimirTicketDirecto(t, anchoPapel, false, true)}
               disabled={ticketBtOcupado}
-              className="text-[10px] font-bold uppercase self-start"
+              className="text-[10px] font-bold uppercase disabled:opacity-50"
               style={{ color: steel }}
             >
-              Conectada: {impresoraBle.device?.name || "impresora"} · Cambiar impresora
+              Imprimir prueba
             </button>
-          )}
+            {(impresoraBle || nombreImpresoraGuardada()) && (
+              <button
+                onClick={() => imprimirTicketDirecto(t, anchoPapel, true)}
+                disabled={ticketBtOcupado}
+                className="text-[10px] font-bold uppercase disabled:opacity-50"
+                style={{ color: steel }}
+              >
+                Cambiar impresora
+              </button>
+            )}
+            {(impresoraBle || nombreImpresoraGuardada()) && (
+              <button
+                onClick={() => {
+                  olvidarImpresoraBle();
+                  setTicketBtEstado({ tipo: "info", texto: "Impresora olvidada. La próxima vez se pedirá elegirla." });
+                }}
+                disabled={ticketBtOcupado}
+                className="text-[10px] font-bold uppercase disabled:opacity-50"
+                style={{ color: paprika }}
+              >
+                Olvidar
+              </button>
+            )}
+          </div>
+          <div className="text-[10px]" style={{ color: ink + "77" }}>
+            Si tu impresora no aparece en la lista o marca error de conexión, usa el botón RawBT (app gratis de
+            Android para impresoras Bluetooth clásicas).
+          </div>
           {ticketBtEstado && (
             <div
               className="text-[11px] font-semibold"
@@ -7737,7 +7880,7 @@ export default function RelojChecador() {
                           : { border: `1px solid ${ink}33`, color: ink }
                       }
                     >
-                      <Printer size={14} /> Ticket {w} mm
+                      <Printer size={14} /> Ticket {w === 57 ? 58 : w} mm
                     </button>
                   ))}
                 </div>
@@ -8187,7 +8330,7 @@ export default function RelojChecador() {
                                 className="flex-1 flex items-center justify-center gap-1 py-1.5 rounded-sm text-[10px] font-bold uppercase"
                                 style={{ border: `1px solid ${ink}33`, color: ink }}
                               >
-                                <Printer size={12} /> Ticket {w} mm
+                                <Printer size={12} /> Ticket {w === 57 ? 58 : w} mm
                               </button>
                             ))}
                           </div>
