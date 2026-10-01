@@ -41,6 +41,124 @@ async function storageSetRetry(key, value, tabla = "kv_store_limpieza", intentos
 }
 
 /* ---------- Tokens: fondo pastel café, a juego con la tarjeta de Limpieza ---------- */
+/* Igual que kvGet, pero además regresa cuándo se guardó por última vez (updated_at),
+   para detectar si otro teléfono lo cambió mientras tanto. */
+async function kvGetConVersion(key, tabla = "kv_store_limpieza") {
+  const { data, error } = await supabase.from(tabla).select("value, updated_at").eq("key", key).maybeSingle();
+  if (error) throw error;
+  return data ? { value: data.value, updatedAt: data.updated_at } : { value: null, updatedAt: null };
+}
+
+/* Guarda solo si nadie más cambió el registro desde que se leyó; si sí, regresa
+   { conflicto: true } (guardarMezclando entonces relee y reaplica). */
+async function kvSetConVersion(key, value, expectedUpdatedAt, tabla = "kv_store_limpieza") {
+  const fecha = new Date().toISOString();
+  if (expectedUpdatedAt == null) {
+    const { error } = await supabase.from(tabla).upsert({ key, value, updated_at: fecha });
+    if (error) throw error;
+    return { ok: true, updatedAt: fecha };
+  }
+  const { data, error } = await supabase
+    .from(tabla)
+    .update({ value, updated_at: fecha })
+    .eq("key", key)
+    .eq("updated_at", expectedUpdatedAt)
+    .select("updated_at");
+  if (error) throw error;
+  if (!data || data.length === 0) return { ok: false, conflicto: true };
+  return { ok: true, updatedAt: fecha };
+}
+
+/* ---------- Guardado "mezclando" (varios teléfonos a la vez) ----------
+   En vez de mandar la lista completa que tenía ESTA pantalla (y chocar o pisar lo que
+   guardó otro teléfono), se lee lo más reciente del servidor, se le aplican SOLO los
+   cambios de esta persona (`aplicar(base)`) y se guarda con control de versión. Si otro
+   teléfono guardó justo en medio, se vuelve a leer y a aplicar (hasta 5 intentos), así
+   no se pierde el avance de nadie. `aplicar` debe regresar el valor nuevo completo, o
+   `undefined` si no hay nada que cambiar. */
+async function guardarMezclando(key, aplicar, tabla = "kv_store_limpieza", intentos = 5) {
+  let ultimoError = null;
+  for (let i = 0; i < intentos; i++) {
+    try {
+      const { value, updatedAt } = await kvGetConVersion(key, tabla);
+      const nuevo = aplicar(value);
+      if (nuevo === undefined) return { ok: true, value, updatedAt, sinCambios: true };
+      const res = await kvSetConVersion(key, nuevo, updatedAt, tabla);
+      if (res.ok) return { ok: true, value: nuevo, updatedAt: res.updatedAt };
+      ultimoError = null; // fue choque con otro teléfono: se relee y se reaplica
+    } catch (e) {
+      ultimoError = e;
+    }
+    await sleep(150 + Math.random() * 350 * (i + 1));
+  }
+  return { ok: false, error: ultimoError || new Error("Muchos guardados al mismo tiempo, intenta de nuevo.") };
+}
+
+/* ---------- Fotos en Supabase Storage (fuera de la base de datos) ----------
+   Antes cada foto se guardaba como texto dentro del catálogo, así que CADA guardado
+   subía y bajaba todas las fotos (cientos de KB). Ahora la foto se sube una sola vez al
+   almacenamiento de archivos y en el catálogo solo queda su dirección (unos 120
+   caracteres). La imagen se ve igual: <img src> acepta ambas formas. */
+const FOTOS_BUCKET = "fotos-inventario";
+
+function esFotoEmbebida(f) {
+  return typeof f === "string" && f.startsWith("data:");
+}
+
+function dataUrlABlob(dataUrl) {
+  const [meta, b64] = dataUrl.split(",");
+  const mime = (meta.match(/data:([^;]+)/) || [])[1] || "image/jpeg";
+  const bin = atob(b64);
+  const arr = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+  return new Blob([arr], { type: mime });
+}
+
+async function subirFoto(dataUrl, carpeta) {
+  const blob = dataUrlABlob(dataUrl);
+  const ext = blob.type === "image/png" ? "png" : blob.type === "image/webp" ? "webp" : "jpg";
+  const path = `${carpeta}/${Date.now()}-${Math.random().toString(36).slice(2, 10)}.${ext}`;
+  const { error } = await supabase.storage.from(FOTOS_BUCKET).upload(path, blob, {
+    contentType: blob.type,
+    cacheControl: "31536000",
+    upsert: false,
+  });
+  if (error) throw error;
+  return supabase.storage.from(FOTOS_BUCKET).getPublicUrl(path).data.publicUrl;
+}
+
+/* Pasa al almacenamiento de archivos las fotos que todavía vengan "embebidas" en una
+   lista guardada (datos viejos, o guardados desde una versión vieja de la app que siga
+   abierta en algún teléfono). Corre en segundo plano, de a 4 fotos a la vez, y guarda
+   mezclando: solo cambia la foto si sigue siendo la misma que se subió. Regresa una
+   función para aplicar el mismo cambio a la pantalla, o null si no había nada. */
+async function migrarFotosEmbebidas(lista, key, tabla, carpeta, campoFoto = "foto") {
+  const pendientes = (lista || []).filter((i) => i && esFotoEmbebida(i[campoFoto]));
+  if (!pendientes.length) return null;
+  const cambios = {};
+  for (let i = 0; i < pendientes.length; i += 4) {
+    const lote = pendientes.slice(i, i + 4);
+    await Promise.all(lote.map(async (it) => {
+      try {
+        cambios[it.id] = { antes: it[campoFoto], url: await subirFoto(it[campoFoto], carpeta) };
+      } catch (e) { /* se reintenta la próxima vez que se abra la app */ }
+    }));
+  }
+  if (!Object.keys(cambios).length) return null;
+  const aplicar = (base) => {
+    if (!Array.isArray(base)) return undefined;
+    let algo = false;
+    const nuevo = base.map((i) => {
+      const c = i && cambios[i.id];
+      if (c && i[campoFoto] === c.antes) { algo = true; return { ...i, [campoFoto]: c.url }; }
+      return i;
+    });
+    return algo ? nuevo : undefined;
+  };
+  const res = await guardarMezclando(key, aplicar, tabla);
+  return res.ok ? (prev) => aplicar(prev) || prev : null;
+}
+
 const C = {
   bg: "#F2E6D6",
   paper: "#FFFDF9",
@@ -218,8 +336,11 @@ async function cargarTareasLimpieza() {
   }
 }
 
-async function guardarTareasLimpieza(tareas) {
-  return storageSetRetry("limpieza_tareas", tareas, "kv_store_limpieza");
+/* Recibe `aplicar(base)` con SOLO el cambio de esta pantalla; se aplica sobre lo más
+   reciente del servidor. Antes se mandaba la lista completa: dos teléfonos se pisaban, y
+   si la carga inicial fallaba (lista vacía) se podía borrar todo el catálogo. */
+async function guardarTareasLimpieza(aplicar) {
+  return guardarMezclando("limpieza_tareas", (base) => aplicar(Array.isArray(base) ? base : []), "kv_store_limpieza");
 }
 
 async function cargarRegistrosLimpieza() {
@@ -231,13 +352,16 @@ async function cargarRegistrosLimpieza() {
   }
 }
 
-async function guardarRegistrosLimpieza(registros) {
+async function guardarRegistrosLimpieza(aplicar) {
   // conserva las últimas ~14 semanas para no crecer indefinidamente
   const corte = new Date();
   corte.setDate(corte.getDate() - 100);
   const corteKey = `${corte.getFullYear()}-${pad2(corte.getMonth() + 1)}-${pad2(corte.getDate())}`;
-  const podados = registros.filter((r) => r.semana >= corteKey);
-  return storageSetRetry("limpieza_registros", podados, "kv_store_limpieza");
+  return guardarMezclando(
+    "limpieza_registros",
+    (base) => aplicar(Array.isArray(base) ? base : []).filter((r) => r.semana >= corteKey),
+    "kv_store_limpieza"
+  );
 }
 
 /* La clave de Gerente ya no se guarda ni se descarga en texto plano: vive
@@ -311,10 +435,15 @@ async function cargarTareasCierre(pin) {
   }
 }
 
-async function guardarTareasCierre(tareas, pin) {
+/* Lo protegido con PIN no tiene control de versión, pero al menos se relee justo antes
+   de guardar y se aplica SOLO el cambio de esta pantalla (`aplicar(base)`), en vez de
+   mandar la lista que se tenía en pantalla (que podía estar vieja o vacía). */
+async function guardarTareasCierre(aplicar, pin) {
   try {
-    const ok = await guardarDatoProtegidoGerente("cierre_tareas", tareas, pin);
-    return { ok };
+    const base = (await leerDatoProtegidoGerente("cierre_tareas", pin)) || [];
+    const nuevo = aplicar(Array.isArray(base) ? base : []);
+    const ok = await guardarDatoProtegidoGerente("cierre_tareas", nuevo, pin);
+    return { ok, value: nuevo };
   } catch (e) {
     return { ok: false, error: e };
   }
@@ -328,15 +457,16 @@ async function cargarRegistrosCierre(pin) {
   }
 }
 
-async function guardarRegistrosCierre(registros, pin) {
+async function guardarRegistrosCierre(aplicar, pin) {
   // conserva los últimos 60 días
   const corte = new Date();
   corte.setDate(corte.getDate() - 60);
   const corteKey = `${corte.getFullYear()}-${pad2(corte.getMonth() + 1)}-${pad2(corte.getDate())}`;
-  const podados = registros.filter((r) => r.fechaKey >= corteKey);
   try {
+    const base = (await leerDatoProtegidoGerente("cierre_registros", pin)) || [];
+    const podados = aplicar(Array.isArray(base) ? base : []).filter((r) => r.fechaKey >= corteKey);
     const ok = await guardarDatoProtegidoGerente("cierre_registros", podados, pin);
-    return { ok };
+    return { ok, value: podados };
   } catch (e) {
     return { ok: false, error: e };
   }
@@ -433,6 +563,11 @@ function LimpiezaTab({ showToast, autoGerente = false }) {
       const [t, r] = await Promise.all([cargarTareasLimpieza(), cargarRegistrosLimpieza()]);
       setTareas(t);
       setRegistros(r);
+      // Fotos de comprobante viejas guardadas dentro de los registros: se pasan al
+      // almacenamiento de archivos en segundo plano (una sola vez).
+      migrarFotosEmbebidas(r, "limpieza_registros", "kv_store_limpieza", "limpieza")
+        .then((aplicarEnPantalla) => { if (aplicarEnPantalla) setRegistros((prev) => (prev ? aplicarEnPantalla(prev) : prev)); })
+        .catch(() => {});
     })();
   }, []);
 
@@ -443,18 +578,28 @@ function LimpiezaTab({ showToast, autoGerente = false }) {
   }
 
   async function guardarNuevaTarea(tarea) {
-    const nuevas = [...tareas, { ...tarea, id: uid() }];
-    setTareas(nuevas);
-    const res = await guardarTareasLimpieza(nuevas);
-    if (!res.ok) showToast("No se pudo guardar la tarea: " + (res.error?.message || "error"));
-    else showToast("Actividad agregada");
+    const nueva = { ...tarea, id: uid() };
+    const aplicar = (base) => (base.some((t) => t.id === nueva.id) ? base : [...base, nueva]);
+    setTareas((prev) => aplicar(prev || []));
+    const res = await guardarTareasLimpieza(aplicar);
+    if (!res.ok) {
+      showToast("No se pudo guardar la tarea: " + (res.error?.message || "error"));
+      setTareas((prev) => (prev || []).filter((t) => t.id !== nueva.id));
+    } else {
+      setTareas(res.value || []);
+      showToast("Actividad agregada");
+    }
   }
 
   async function eliminarTarea(id) {
-    const nuevas = tareas.filter((t) => t.id !== id);
-    setTareas(nuevas);
-    await guardarTareasLimpieza(nuevas);
-    showToast("Actividad eliminada");
+    const aplicar = (base) => base.filter((t) => t.id !== id);
+    setTareas((prev) => aplicar(prev || []));
+    const res = await guardarTareasLimpieza(aplicar);
+    if (!res.ok) showToast("No se pudo eliminar: " + (res.error?.message || "error"));
+    else {
+      setTareas(res.value || []);
+      showToast("Actividad eliminada");
+    }
   }
 
   async function marcarHecha(tarea, foto, quien) {
@@ -469,12 +614,17 @@ function LimpiezaTab({ showToast, autoGerente = false }) {
       quien: quien || "",
       foto,
     };
-    const nuevos = [...registros, nuevoRegistro];
-    setRegistros(nuevos);
+    const aplicar = (base) => (base.some((r) => r.id === nuevoRegistro.id) ? base : [...base, nuevoRegistro]);
+    setRegistros((prev) => aplicar(prev || []));
     setCompletando(null);
-    const res = await guardarRegistrosLimpieza(nuevos);
-    if (!res.ok) showToast("No se pudo guardar: " + (res.error?.message || "error"));
-    else showToast("Actividad registrada");
+    const res = await guardarRegistrosLimpieza(aplicar);
+    if (!res.ok) {
+      showToast("No se pudo guardar: " + (res.error?.message || "error"));
+      setRegistros((prev) => (prev || []).filter((r) => r.id !== nuevoRegistro.id));
+    } else {
+      setRegistros(res.value || []);
+      showToast("Actividad registrada");
+    }
   }
 
   const areasDisponibles = useMemo(() => {
@@ -636,7 +786,16 @@ function CompletarTareaModal({ tarea, onCancel, onConfirm }) {
     try {
       let dataUrl = await compressImage(file, 260, 0.6);
       if (dataUrl.length > 180000) dataUrl = await compressImage(file, 180, 0.45);
-      setFoto(dataUrl);
+      if (dataUrl.length > 180000) {
+        setError("La foto sigue muy pesada, intenta con otra.");
+      } else {
+        // Se sube al almacenamiento de archivos; en el registro solo queda la dirección.
+        try {
+          setFoto(await subirFoto(dataUrl, "limpieza"));
+        } catch (errSubida) {
+          setError("No se pudo subir la foto. Revisa tu conexión e intenta de nuevo.");
+        }
+      }
     } catch (err) {
       setError("No se pudo procesar la foto, intenta con otra.");
     }
@@ -947,30 +1106,32 @@ function CierreSeccion({ pin }) {
   }, []);
 
   async function agregarTarea(tarea) {
-    const nuevas = [...tareas, { ...tarea, id: uid() }];
-    setTareas(nuevas);
-    const res = await guardarTareasCierre(nuevas, pin);
-    if (!res.ok) console.error("No se pudo guardar la tarea de cierre:", res.error);
+    const nueva = { ...tarea, id: uid() };
+    const aplicar = (base) => (base.some((t) => t.id === nueva.id) ? base : [...base, nueva]);
+    setTareas((prev) => aplicar(prev || []));
+    const res = await guardarTareasCierre(aplicar, pin);
+    if (res.ok) setTareas(res.value);
+    else console.error("No se pudo guardar la tarea de cierre:", res.error);
   }
 
   async function eliminarTarea(id) {
-    const nuevas = tareas.filter((t) => t.id !== id);
-    setTareas(nuevas);
-    const res = await guardarTareasCierre(nuevas, pin);
-    if (!res.ok) console.error("No se pudo eliminar la tarea de cierre:", res.error);
+    const aplicar = (base) => base.filter((t) => t.id !== id);
+    setTareas((prev) => aplicar(prev || []));
+    const res = await guardarTareasCierre(aplicar, pin);
+    if (res.ok) setTareas(res.value);
+    else console.error("No se pudo eliminar la tarea de cierre:", res.error);
   }
 
   async function toggleHecha(tarea, yaHecha) {
     const hoy = hoyKey();
-    let nuevos;
-    if (yaHecha) {
-      nuevos = registros.filter((r) => !(r.fechaKey === hoy && r.tareaId === tarea.id));
-    } else {
-      nuevos = [...registros, { id: uid(), tareaId: tarea.id, area: tarea.area, fechaKey: hoy, fecha: new Date().toISOString() }];
-    }
-    setRegistros(nuevos);
-    const res = await guardarRegistrosCierre(nuevos, pin);
-    if (!res.ok) console.error("No se pudo guardar el registro de cierre:", res.error);
+    const nuevoReg = { id: uid(), tareaId: tarea.id, area: tarea.area, fechaKey: hoy, fecha: new Date().toISOString() };
+    const aplicar = yaHecha
+      ? (base) => base.filter((r) => !(r.fechaKey === hoy && r.tareaId === tarea.id))
+      : (base) => (base.some((r) => r.fechaKey === hoy && r.tareaId === tarea.id) ? base : [...base, nuevoReg]);
+    setRegistros((prev) => aplicar(prev || []));
+    const res = await guardarRegistrosCierre(aplicar, pin);
+    if (res.ok) setRegistros(res.value);
+    else console.error("No se pudo guardar el registro de cierre:", res.error);
   }
 
   if (tareas === null || registros === null) {

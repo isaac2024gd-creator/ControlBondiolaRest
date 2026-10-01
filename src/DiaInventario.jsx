@@ -102,6 +102,96 @@ function podarPorFecha(estado) {
   return nuevo;
 }
 
+/* ---------- Guardado "mezclando" (varios teléfonos a la vez) ----------
+   En vez de mandar la lista completa que tenía ESTA pantalla (y chocar o pisar lo que
+   guardó otro teléfono), se lee lo más reciente del servidor, se le aplican SOLO los
+   cambios de esta persona (`aplicar(base)`) y se guarda con control de versión. Si otro
+   teléfono guardó justo en medio, se vuelve a leer y a aplicar (hasta 5 intentos), así
+   no se pierde el avance de nadie. `aplicar` debe regresar el valor nuevo completo, o
+   `undefined` si no hay nada que cambiar. */
+async function guardarMezclando(key, aplicar, tabla = "kv_store_dia", intentos = 5) {
+  let ultimoError = null;
+  for (let i = 0; i < intentos; i++) {
+    try {
+      const { value, updatedAt } = await kvGetConVersion(key, tabla);
+      const nuevo = aplicar(value);
+      if (nuevo === undefined) return { ok: true, value, updatedAt, sinCambios: true };
+      const res = await kvSetConVersion(key, nuevo, updatedAt, tabla);
+      if (res.ok) return { ok: true, value: nuevo, updatedAt: res.updatedAt };
+      ultimoError = null; // fue choque con otro teléfono: se relee y se reaplica
+    } catch (e) {
+      ultimoError = e;
+    }
+    await sleep(150 + Math.random() * 350 * (i + 1));
+  }
+  return { ok: false, error: ultimoError || new Error("Muchos guardados al mismo tiempo, intenta de nuevo.") };
+}
+
+/* ---------- Fotos en Supabase Storage (fuera de la base de datos) ----------
+   Antes cada foto se guardaba como texto dentro del catálogo, así que CADA guardado
+   subía y bajaba todas las fotos (cientos de KB). Ahora la foto se sube una sola vez al
+   almacenamiento de archivos y en el catálogo solo queda su dirección (unos 120
+   caracteres). La imagen se ve igual: <img src> acepta ambas formas. */
+const FOTOS_BUCKET = "fotos-inventario";
+
+function esFotoEmbebida(f) {
+  return typeof f === "string" && f.startsWith("data:");
+}
+
+function dataUrlABlob(dataUrl) {
+  const [meta, b64] = dataUrl.split(",");
+  const mime = (meta.match(/data:([^;]+)/) || [])[1] || "image/jpeg";
+  const bin = atob(b64);
+  const arr = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+  return new Blob([arr], { type: mime });
+}
+
+async function subirFoto(dataUrl, carpeta) {
+  const blob = dataUrlABlob(dataUrl);
+  const ext = blob.type === "image/png" ? "png" : blob.type === "image/webp" ? "webp" : "jpg";
+  const path = `${carpeta}/${Date.now()}-${Math.random().toString(36).slice(2, 10)}.${ext}`;
+  const { error } = await supabase.storage.from(FOTOS_BUCKET).upload(path, blob, {
+    contentType: blob.type,
+    cacheControl: "31536000",
+    upsert: false,
+  });
+  if (error) throw error;
+  return supabase.storage.from(FOTOS_BUCKET).getPublicUrl(path).data.publicUrl;
+}
+
+/* Pasa al almacenamiento de archivos las fotos que todavía vengan "embebidas" en una
+   lista guardada (datos viejos, o guardados desde una versión vieja de la app que siga
+   abierta en algún teléfono). Corre en segundo plano, de a 4 fotos a la vez, y guarda
+   mezclando: solo cambia la foto si sigue siendo la misma que se subió. Regresa una
+   función para aplicar el mismo cambio a la pantalla, o null si no había nada. */
+async function migrarFotosEmbebidas(lista, key, tabla, carpeta, campoFoto = "foto") {
+  const pendientes = (lista || []).filter((i) => i && esFotoEmbebida(i[campoFoto]));
+  if (!pendientes.length) return null;
+  const cambios = {};
+  for (let i = 0; i < pendientes.length; i += 4) {
+    const lote = pendientes.slice(i, i + 4);
+    await Promise.all(lote.map(async (it) => {
+      try {
+        cambios[it.id] = { antes: it[campoFoto], url: await subirFoto(it[campoFoto], carpeta) };
+      } catch (e) { /* se reintenta la próxima vez que se abra la app */ }
+    }));
+  }
+  if (!Object.keys(cambios).length) return null;
+  const aplicar = (base) => {
+    if (!Array.isArray(base)) return undefined;
+    let algo = false;
+    const nuevo = base.map((i) => {
+      const c = i && cambios[i.id];
+      if (c && i[campoFoto] === c.antes) { algo = true; return { ...i, [campoFoto]: c.url }; }
+      return i;
+    });
+    return algo ? nuevo : undefined;
+  };
+  const res = await guardarMezclando(key, aplicar, tabla);
+  return res.ok ? (prev) => aplicar(prev) || prev : null;
+}
+
 /* ---------- Tokens (mismos que PAR, para identidad consistente) ---------- */
 const C = {
   bg: "#E8F0EB",
@@ -132,6 +222,9 @@ const SEED_ITEMS = [
 ];
 
 function uid() { return Math.random().toString(36).slice(2, 10); }
+
+// Respaldo en el teléfono de lo contado sin guardar (ver ConteoTab).
+const BORRADOR_KEY = "dia_borrador_conteo_v1";
 
 /* Lee el catálogo de PAR (misma base de datos, tabla propia) para poder importar productos a DÍA */
 async function cargarProductosPar() {
@@ -226,15 +319,10 @@ function hoyLocalStr(d = new Date()) {
   return `${y}-${m}-${day}`;
 }
 
+/* Guarda la "foto" del día en el historial (para promedios). Corre en segundo plano
+   (no hace esperar a quien cuenta) y mezclando, para que dos teléfonos no se pisen. */
 async function appendHistorial(items, fecha, diaObjetivo) {
   try {
-    let hist = [];
-    try {
-      const val = await kvGet("dia_historial_v1");
-      hist = val || [];
-    } catch (e) {
-      hist = [];
-    }
     const diaKey = hoyLocalStr(new Date(fecha)); // YYYY-MM-DD, día calendario LOCAL
     const entrada = {
       fecha,
@@ -247,11 +335,14 @@ async function appendHistorial(items, fecha, diaObjetivo) {
     // Si ya se guardó algo hoy (otra área, u otro guardado del mismo día), se reemplaza
     // esa entrada con la foto completa más reciente en vez de agregar una nueva — evita
     // contar el mismo día dos veces en los promedios de consumo.
-    const idxHoy = hist.findIndex((h) => h.fecha && hoyLocalStr(new Date(h.fecha)) === diaKey);
-    if (idxHoy >= 0) hist[idxHoy] = entrada;
-    else hist.push(entrada);
-    if (hist.length > 45) hist = hist.slice(hist.length - 45);
-    await storageSetRetry("dia_historial_v1", hist);
+    await guardarMezclando("dia_historial_v1", (base) => {
+      let hist = Array.isArray(base) ? [...base] : [];
+      const idxHoy = hist.findIndex((h) => h.fecha && hoyLocalStr(new Date(h.fecha)) === diaKey);
+      if (idxHoy >= 0) hist[idxHoy] = entrada;
+      else hist.push(entrada);
+      if (hist.length > 45) hist = hist.slice(hist.length - 45);
+      return hist;
+    });
   } catch (e) {
     /* no bloquea el guardado del conteo si el historial falla */
   }
@@ -375,25 +466,24 @@ export default function DiaInventario() {
     })();
   }, []);
 
-  async function persistEstadoAreas(nuevoEstado) {
-    const podado = podarPorFecha(nuevoEstado);
-    setEstadoAreas(podado);
-    const res = await storageSetRetryConVersion("dia_areas_estado_v1", podado, estadoAreasUpdatedAt);
+  // Recibe una función `aplicar(base)` que hace SOLO el cambio de esta pantalla sobre lo
+  // más reciente del servidor (ver guardarMezclando). Antes, si otro teléfono había
+  // guardado en medio, el cambio se descartaba sin avisar y el área no quedaba marcada.
+  async function persistEstadoAreas(aplicar) {
+    const aplicarPodado = (base) => podarPorFecha(aplicar(base || {}));
+    setEstadoAreas((prev) => aplicarPodado(prev));
+    const res = await guardarMezclando("dia_areas_estado_v1", aplicarPodado);
     if (res.ok) {
+      setEstadoAreas(res.value || {});
       setEstadoAreasUpdatedAt(res.updatedAt);
       return res;
     }
-    if (res.conflicto) {
-      try {
-        const fresh = await kvGetConVersion("dia_areas_estado_v1");
-        if (fresh.value) {
-          setEstadoAreas(fresh.value);
-          setEstadoAreasUpdatedAt(fresh.updatedAt);
-        }
-      } catch (e) { /* se reintentará en el próximo guardado */ }
-      return res;
-    }
     showToast("No se pudo guardar el estado del área: " + (res.error?.message || "intenta de nuevo"));
+    try {
+      const fresh = await kvGetConVersion("dia_areas_estado_v1");
+      setEstadoAreas(fresh.value || {});
+      setEstadoAreasUpdatedAt(fresh.updatedAt);
+    } catch (e) { /* se queda como está */ }
     return res;
   }
 
@@ -412,6 +502,11 @@ export default function DiaInventario() {
         if (value) {
           setItems(value);
           setItemsUpdatedAt(updatedAt);
+          // Fotos viejas que todavía vengan dentro del catálogo: se pasan al almacenamiento
+          // de archivos en segundo plano (una sola vez). No bloquea la pantalla.
+          migrarFotosEmbebidas(value, "dia_items_v1", "kv_store_dia", "dia")
+            .then((aplicarEnPantalla) => { if (aplicarEnPantalla) setItems((prev) => (prev ? aplicarEnPantalla(prev) : prev)); })
+            .catch(() => {});
         } else {
           const fecha = new Date().toISOString();
           await kvSet("dia_items_v1", SEED_ITEMS);
@@ -430,28 +525,25 @@ export default function DiaInventario() {
     setLoadError(ultimoError?.message || "No se pudo conectar con el servidor.");
   }
 
-  async function persist(newItems) {
-    setItems(newItems);
-    const res = await storageSetRetryConVersion("dia_items_v1", newItems, itemsUpdatedAt);
+  // Recibe `aplicar(base)`: SOLO los cambios de esta pantalla, que se aplican sobre lo
+  // más reciente del servidor. Así, si dos teléfonos cuentan áreas distintas al mismo
+  // tiempo, se guardan los dos avances (antes el segundo chocaba y se perdía lo contado).
+  async function persist(aplicar) {
+    setItems((prev) => aplicar(prev || []) || prev);
+    const res = await guardarMezclando("dia_items_v1", (base) => aplicar(Array.isArray(base) ? base : []));
     if (res.ok) {
+      if (Array.isArray(res.value)) setItems(res.value);
       setItemsUpdatedAt(res.updatedAt);
       return res;
     }
-    if (res.conflicto) {
-      // Otro dispositivo guardó algo distinto justo mientras esta pantalla tenía datos
-      // más viejos: en vez de sobrescribirlo en silencio, se avisa y se trae lo más
-      // reciente. Lo que se intentaba guardar aquí NO quedó guardado.
-      showToast("Alguien más acaba de guardar cambios aquí. Se actualizó la información — revisa e intenta de nuevo.");
-      try {
-        const fresh = await kvGetConVersion("dia_items_v1");
-        if (fresh.value) {
-          setItems(fresh.value);
-          setItemsUpdatedAt(fresh.updatedAt);
-        }
-      } catch (e) { /* si tampoco se puede releer, se deja como está y se reintentará en el próximo guardado */ }
-      return res;
-    }
-    showToast("No se pudo guardar tras varios intentos: " + (res.error?.message || "error desconocido"));
+    showToast("No se pudo guardar tras varios intentos: " + (res.error?.message || "revisa tu conexión"));
+    try {
+      const fresh = await kvGetConVersion("dia_items_v1");
+      if (fresh.value) {
+        setItems(fresh.value);
+        setItemsUpdatedAt(fresh.updatedAt);
+      }
+    } catch (e) { /* se reintentará en el próximo guardado */ }
     return res;
   }
 
@@ -501,7 +593,14 @@ export default function DiaInventario() {
           />
         )}
         {tab === "inventario" && <InventarioTab items={items} onSave={persist} showToast={showToast} />}
-        {tab === "pendientes" && <PendientesTab items={items} estadoAreas={estadoAreas} historialReciente={historialReciente} />}
+        {tab === "pendientes" && (
+          <PendientesTab
+            items={items}
+            estadoAreas={estadoAreas}
+            historialReciente={historialReciente}
+            onSaveEstadoAreas={persistEstadoAreas}
+          />
+        )}
         {tab === "historial" && <HistorialTab items={items} />}
       </main>
 
@@ -559,7 +658,19 @@ function BottomNav({ tab, setTab, items }) {
 
 /* ---------- CONTEO TAB ---------- */
 function ConteoTab({ items, onSave, showToast, estadoAreas, onSaveEstadoAreas, historialReciente }) {
-  const [draft, setDraft] = useState(() => Object.fromEntries(items.map((i) => [i.id, i.stockActual])));
+  // `draft` guarda SOLO lo tecleado que todavía no se guarda ({ idProducto: cantidad }).
+  // Antes era una copia de todo el catálogo que se reiniciaba cada vez que llegaban datos
+  // nuevos del servidor — y con eso se borraba lo que la persona llevaba contado.
+  // Además se respalda en el teléfono (solo del día), por si se cierra o recarga la app.
+  const [draft, setDraft] = useState(() => {
+    try {
+      const raw = localStorage.getItem(BORRADOR_KEY);
+      const b = raw ? JSON.parse(raw) : null;
+      if (b && b.fecha === hoyLocalStr() && b.valores && typeof b.valores === "object") return b.valores;
+    } catch (e) { /* sin respaldo */ }
+    return {};
+  });
+  const guardandoRef = useRef(false);
   const [query, setQuery] = useState("");
   const [areaActual, setAreaActual] = useState(undefined);
   const [cambiandoArea, setCambiandoArea] = useState(false);
@@ -569,14 +680,16 @@ function ConteoTab({ items, onSave, showToast, estadoAreas, onSaveEstadoAreas, h
   const [confirmReabrir, setConfirmReabrir] = useState(false);
   const [reabriendo, setReabriendo] = useState(false);
 
-  const hayCambios = items.some((i) => {
-    const val = draft[i.id];
-    return val !== undefined && val !== i.stockActual;
-  });
+  const cambiosPendientes = items.filter((i) => draft[i.id] !== undefined && draft[i.id] !== i.stockActual);
+  const hayCambios = cambiosPendientes.length > 0;
 
+  // Respaldo en el teléfono de lo no guardado (se borra solo al día siguiente).
   useEffect(() => {
-    setDraft(Object.fromEntries(items.map((i) => [i.id, i.stockActual])));
-  }, [items]);
+    try {
+      if (Object.keys(draft).length === 0) localStorage.removeItem(BORRADOR_KEY);
+      else localStorage.setItem(BORRADOR_KEY, JSON.stringify({ fecha: hoyLocalStr(), valores: draft }));
+    } catch (e) { /* sin espacio o modo privado: se sigue sin respaldo */ }
+  }, [draft]);
 
   useEffect(() => {
     try {
@@ -642,61 +755,80 @@ function ConteoTab({ items, onSave, showToast, estadoAreas, onSaveEstadoAreas, h
   }
 
   async function guardar(finalizar) {
+    // Candado contra doble toque: antes dos toques rápidos mandaban dos guardados que
+    // chocaban entre sí.
+    if (guardandoRef.current) return;
+    guardandoRef.current = true;
     setGuardando(true);
-    const fecha = new Date().toISOString();
-    const updated = items.map((i) => {
-      const nuevoStock = draft[i.id] ?? i.stockActual;
-      const cambio = nuevoStock !== i.stockActual;
-      // Solo se marca "última actualización" en lo que de verdad se contó ahora —
-      // antes se pisaba la fecha de TODOS los productos aunque no se hubieran tocado.
-      return cambio ? { ...i, stockActual: nuevoStock, ultimaActualizacion: fecha } : i;
-    });
-    const res = await onSave(updated);
-    if (!res?.ok) {
-      // Antes se mostraba "Conteo de hoy guardado" sin esperar esta confirmación.
-      // Ahora, si el guardado real falló, se avisa y NO se marca como guardado.
+    try {
+      const fecha = new Date().toISOString();
+      // Solo lo que esta persona cambió: { id: cantidad }.
+      const cambios = {};
+      cambiosPendientes.forEach((i) => { cambios[i.id] = draft[i.id]; });
+      const hayQueGuardar = Object.keys(cambios).length > 0;
+
+      if (hayQueGuardar) {
+        // Solo se marca "última actualización" en lo que de verdad se contó ahora.
+        const aplicar = (base) => base.map((i) =>
+          Object.prototype.hasOwnProperty.call(cambios, i.id) && cambios[i.id] !== i.stockActual
+            ? { ...i, stockActual: cambios[i.id], ultimaActualizacion: fecha }
+            : i
+        );
+        const res = await onSave(aplicar);
+        if (!res?.ok) {
+          // onSave ya avisó. Lo tecleado sigue en pantalla (y respaldado) para reintentar.
+          return;
+        }
+        // Se quita del borrador solo lo que se guardó tal cual (si alguien siguió
+        // tecleando mientras se guardaba, eso se conserva).
+        setDraft((d) => {
+          const n = { ...d };
+          Object.keys(cambios).forEach((id) => { if (n[id] === cambios[id]) delete n[id]; });
+          return n;
+        });
+        // El historial pesa mucho: se guarda en segundo plano, sin hacer esperar.
+        appendHistorial(Array.isArray(res.value) ? res.value : items, fecha, diaManana);
+      }
+
+      // Si es un área real, además dejamos constancia de que avanzó / terminó su conteo hoy.
+      if (esAreaReal && onSaveEstadoAreas) {
+        const area = areaActual;
+        await onSaveEstadoAreas((base) => {
+          const prevArea = base?.[hoyStr]?.[area] || {};
+          return {
+            ...(base || {}),
+            [hoyStr]: {
+              ...(base?.[hoyStr] || {}),
+              [area]: {
+                finalizado: !!finalizar || !!prevArea.finalizado,
+                finalizadoEn: finalizar ? fecha : (prevArea.finalizadoEn || null),
+                actualizadoEn: fecha,
+              },
+            },
+          };
+        });
+      }
+
+      setGuardado(true);
+      setConfirmFinalizar(false);
+      showToast(finalizar ? "Conteo de hoy finalizado" : "Avance guardado");
+    } finally {
+      guardandoRef.current = false;
       setGuardando(false);
-      // Si fue un conflicto con otro dispositivo, onSave ya mostró un aviso más claro —
-      // no lo tapamos con este mensaje genérico.
-      if (!res?.conflicto) showToast("No se pudo guardar el conteo: " + (res?.error?.message || "intenta de nuevo"));
-      return;
     }
-    await appendHistorial(updated, fecha, diaManana);
-
-    // Si es un área real, además dejamos constancia de que avanzó / terminó su conteo hoy,
-    // para el indicador de la pestaña de Pendientes.
-    if (esAreaReal && onSaveEstadoAreas) {
-      const nuevoEstado = {
-        ...(estadoAreas || {}),
-        [hoyStr]: {
-          ...(estadoAreas?.[hoyStr] || {}),
-          [areaActual]: {
-            finalizado: !!finalizar,
-            finalizadoEn: finalizar ? fecha : (estadoHoyArea?.finalizadoEn || null),
-            actualizadoEn: fecha,
-          },
-        },
-      };
-      await onSaveEstadoAreas(nuevoEstado);
-    }
-
-    setGuardando(false);
-    setGuardado(true);
-    setConfirmFinalizar(false);
-    showToast(finalizar ? "Conteo de hoy finalizado" : "Avance guardado");
   }
 
   async function reabrir() {
     if (!esAreaReal || !onSaveEstadoAreas) { setConfirmReabrir(false); return; }
     setReabriendo(true);
-    const nuevoEstado = {
-      ...(estadoAreas || {}),
+    const area = areaActual;
+    await onSaveEstadoAreas((base) => ({
+      ...(base || {}),
       [hoyStr]: {
-        ...(estadoAreas?.[hoyStr] || {}),
-        [areaActual]: { ...(estadoHoyArea || {}), finalizado: false },
+        ...(base?.[hoyStr] || {}),
+        [area]: { ...(base?.[hoyStr]?.[area] || {}), finalizado: false },
       },
-    };
-    await onSaveEstadoAreas(nuevoEstado);
+    }));
     setReabriendo(false);
     setConfirmReabrir(false);
     setGuardado(false);
@@ -751,6 +883,12 @@ function ConteoTab({ items, onSave, showToast, estadoAreas, onSaveEstadoAreas, h
         <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Buscar producto..." className="w-full pl-9 pr-3 py-2.5 rounded-xl text-sm outline-none" style={{ border: `1px solid ${C.line}`, background: C.paper }} />
       </div>
 
+      {hayCambios && !guardando && (
+        <div className="flex items-center gap-1.5 mb-2.5 px-3 py-2 rounded-xl" style={{ background: C.warnBg, color: C.warn, fontSize: 12, fontWeight: 600 }}>
+          <AlertTriangle size={13} /> {cambiosPendientes.length} producto{cambiosPendientes.length === 1 ? "" : "s"} sin guardar
+        </div>
+      )}
+
       {noAplicanHoy > 0 && (
         <p style={{ fontSize: 11.5, color: C.inkSoft, marginBottom: 10 }}>
           {noAplicanHoy} producto{noAplicanHoy === 1 ? "" : "s"} no se cuenta{noAplicanHoy === 1 ? "" : "n"} hoy ({DIAS[diaHoy]}).
@@ -765,7 +903,7 @@ function ConteoTab({ items, onSave, showToast, estadoAreas, onSaveEstadoAreas, h
           </div>
           <div>
             {grouped[sub].map((item, idx) => {
-              const val = draft[item.id] ?? 0;
+              const val = draft[item.id] ?? item.stockActual ?? 0;
               const minimoManana = nivelEfectivo(item, diaManana);
               const status = statusOf({ ...item, stockActual: val, nivelMinimo: minimoManana });
               const s = STATUS_STYLE[status];
@@ -821,17 +959,19 @@ function ConteoTab({ items, onSave, showToast, estadoAreas, onSaveEstadoAreas, h
         </p>
       )}
 
-      {esAreaReal && !finalizada && (hayCambios || guardando) && (
+      {esAreaReal && !finalizada && (
         <div className="fixed left-1/2 flex items-center gap-2" style={{ bottom: 76, transform: "translateX(-50%)" }}>
-          <button
-            onClick={() => guardar(false)}
-            disabled={guardando}
-            className="flex items-center gap-1.5 px-4 py-3 rounded-full shadow-lg"
-            style={{ background: C.paper, border: `1px solid ${C.accent}`, color: C.accent, fontWeight: 600, fontSize: 13, opacity: guardando ? 0.85 : 1 }}
-          >
-            {guardando ? <Loader2 size={15} className="animate-spin" /> : <Save size={15} />}
-            Guardar avance
-          </button>
+          {(hayCambios || guardando) && (
+            <button
+              onClick={() => guardar(false)}
+              disabled={guardando}
+              className="flex items-center gap-1.5 px-4 py-3 rounded-full shadow-lg"
+              style={{ background: C.paper, border: `1px solid ${C.accent}`, color: C.accent, fontWeight: 600, fontSize: 13, opacity: guardando ? 0.85 : 1 }}
+            >
+              {guardando ? <Loader2 size={15} className="animate-spin" /> : <Save size={15} />}
+              {guardando ? "Guardando..." : "Guardar avance"}
+            </button>
+          )}
           <button
             onClick={() => setConfirmFinalizar(true)}
             disabled={guardando}
@@ -855,7 +995,7 @@ function ConteoTab({ items, onSave, showToast, estadoAreas, onSaveEstadoAreas, h
         </button>
       )}
 
-      {guardado && !hayCambios && !guardando && !finalizada && (
+      {!esAreaReal && guardado && !hayCambios && !guardando && !finalizada && (
         <div
           className="fixed left-1/2 flex items-center gap-2 px-5 py-3 rounded-full shadow-lg"
           style={{ bottom: 76, transform: "translateX(-50%)", background: C.ok, color: "#fff", fontWeight: 600, fontSize: 14 }}
@@ -905,18 +1045,25 @@ function AreaPicker({ areas, sinArea, onElegir, onCancelar, estadoAreas, hoyStr 
           const estado = estadoAreas?.[hoy]?.[a];
           const terminada = !!estado?.finalizado;
           const enProgreso = !terminada && !!estado?.actualizadoEn;
+          const colorEstado = terminada ? C.ok : enProgreso ? C.warn : C.critical;
           return (
-            <button key={a} onClick={() => onElegir(a)} className="w-full py-4 rounded-2xl text-left px-5 flex items-center justify-between" style={{ background: C.paper, border: `1px solid ${terminada ? C.ok : C.line}` }}>
-              <div className="min-w-0">
-                <span style={{ fontWeight: 600, fontSize: 15 }}>{a}</span>
-                {terminada && (
-                  <div className="flex items-center gap-1 mt-0.5" style={{ fontSize: 11, color: C.ok, fontWeight: 600 }}>
-                    <Check size={12} /> Conteo terminado
-                  </div>
-                )}
-                {enProgreso && (
-                  <div style={{ fontSize: 11, color: C.warn, fontWeight: 600, marginTop: 2 }}>En progreso</div>
-                )}
+            <button key={a} onClick={() => onElegir(a)} className="w-full py-4 rounded-2xl text-left px-5 flex items-center justify-between" style={{ background: C.paper, border: `1.5px solid ${colorEstado}` }}>
+              <div className="min-w-0 flex items-center gap-2.5">
+                <span className="rounded-full flex-shrink-0" style={{ width: 9, height: 9, background: colorEstado }} />
+                <div className="min-w-0">
+                  <span style={{ fontWeight: 600, fontSize: 15 }}>{a}</span>
+                  {terminada && (
+                    <div className="flex items-center gap-1 mt-0.5" style={{ fontSize: 11, color: C.ok, fontWeight: 600 }}>
+                      <Check size={12} /> Conteo terminado
+                    </div>
+                  )}
+                  {enProgreso && (
+                    <div style={{ fontSize: 11, color: C.warn, fontWeight: 600, marginTop: 2 }}>En progreso</div>
+                  )}
+                  {!terminada && !enProgreso && (
+                    <div style={{ fontSize: 11, color: C.critical, fontWeight: 600, marginTop: 2 }}>Sin iniciar</div>
+                  )}
+                </div>
               </div>
               <ChevronRight size={18} style={{ color: C.inkSoft, flexShrink: 0 }} />
             </button>
@@ -948,29 +1095,25 @@ function InventarioTab({ items, onSave, showToast }) {
 
   async function upsert(item) {
     const esNuevo = !item.id;
-    const nuevaLista = esNuevo
-      ? [...items, { ...item, id: uid() }]
-      : items.map((i) => (i.id === item.id ? { ...i, ...item } : i));
+    const conId = esNuevo ? { ...item, id: uid() } : item;
+    // Solo el cambio de este producto, aplicado sobre lo más reciente del servidor.
+    const aplicar = (base) => (esNuevo
+      ? (base.some((i) => i.id === conId.id) ? base : [...base, conId])
+      : base.map((i) => (i.id === conId.id ? { ...i, ...conId } : i)));
     // Antes se mostraba "Producto actualizado/agregado" de inmediato, sin esperar a que
     // Supabase confirmara. Ahora se espera esa confirmación antes de avisar y cerrar el
     // formulario, para no perder lo capturado si el guardado falla o hay un conflicto.
-    const res = await onSave(nuevaLista);
-    if (!res?.ok) {
-      if (!res?.conflicto) showToast("No se pudo guardar el producto: " + (res?.error?.message || "intenta de nuevo"));
-      return;
-    }
+    const res = await onSave(aplicar);
+    if (!res?.ok) return; // onSave ya avisó; el formulario sigue abierto con lo capturado
     showToast(esNuevo ? "Producto agregado" : "Producto actualizado");
     setShowForm(false);
     setEditing(null);
   }
 
   async function remove(id) {
-    const res = await onSave(items.filter((i) => i.id !== id));
+    const res = await onSave((base) => base.filter((i) => i.id !== id));
     setConfirmDelete(null);
-    if (!res?.ok) {
-      if (!res?.conflicto) showToast("No se pudo eliminar el producto: " + (res?.error?.message || "intenta de nuevo"));
-      return;
-    }
+    if (!res?.ok) return;
     showToast("Producto eliminado");
   }
 
@@ -1123,7 +1266,14 @@ function ItemForm({ initial, categorias, areas, subareas, onCancel, onSubmit }) 
       let dataUrl = await compressImage(file, 260, 0.6);
       if (dataUrl.length > 180000) dataUrl = await compressImage(file, 180, 0.45);
       if (dataUrl.length > 180000) setError("La foto sigue muy pesada, intenta con otra.");
-      else setFoto(dataUrl);
+      else {
+        // Se sube al almacenamiento de archivos; en el producto solo queda la dirección.
+        try {
+          setFoto(await subirFoto(dataUrl, "dia"));
+        } catch (errSubida) {
+          setError("No se pudo subir la foto. Revisa tu conexión e intenta de nuevo.");
+        }
+      }
     } catch (err) {
       setError("No se pudo procesar la foto, intenta con otra.");
     }
@@ -1471,11 +1621,11 @@ function ResumenAreasHoy({ areasDelDia, estadoHoy, areasTerminadas }) {
           const estado = estadoHoy[a];
           const terminada = !!estado?.finalizado;
           const enProgreso = !terminada && !!estado?.actualizadoEn;
-          const color = terminada ? C.ok : enProgreso ? C.warn : C.inkSoft;
-          const bg = terminada ? C.okBg : enProgreso ? C.warnBg : C.bg;
+          const color = terminada ? C.ok : enProgreso ? C.warn : C.critical;
+          const bg = terminada ? C.okBg : enProgreso ? C.warnBg : C.criticalBg;
           return (
             <span key={a} className="flex items-center gap-1 px-2.5 py-1.5 rounded-full" style={{ background: bg, color, fontSize: 11.5, fontWeight: 600 }}>
-              {terminada ? <Check size={11} /> : enProgreso ? <Loader2 size={11} /> : null}
+              {terminada ? <Check size={11} /> : enProgreso ? <Loader2 size={11} /> : <X size={11} />}
               {a}
             </span>
           );
@@ -1550,7 +1700,7 @@ function ResumenCierreDia({ diaCerrado, cierreHoy, cerrando, reabriendoDia, onCe
   );
 }
 
-function PendientesTab({ items, estadoAreas, historialReciente }) {
+function PendientesTab({ items, estadoAreas, historialReciente, onSaveEstadoAreas }) {
   const [checked, setChecked] = useState({});
   const [cargandoChecked, setCargandoChecked] = useState(true);
   // Si el día de hoy ya se marcó como "cerrado" desde esta misma pestaña — evita que la
@@ -1560,6 +1710,11 @@ function PendientesTab({ items, estadoAreas, historialReciente }) {
   const [reabriendoDia, setReabriendoDia] = useState(false);
   const [confirmCerrar, setConfirmCerrar] = useState(false);
   const [confirmReabrirDia, setConfirmReabrirDia] = useState(false);
+  // Reinicio manual del día: a diferencia de "Cerrar día" (que solo bloquea la lista),
+  // esto borra el progreso de HOY (pendientes marcados, cierre, y conteo por área) para
+  // empezar como si fuera un día nuevo, sin esperar a que cambie la fecha del calendario.
+  const [reiniciando, setReiniciando] = useState(false);
+  const [confirmReiniciar, setConfirmReiniciar] = useState(false);
   const diaManana = (new Date().getDay() + 1) % 7;
   const hoyStr = hoyLocalStr();
 
@@ -1599,8 +1754,10 @@ function PendientesTab({ items, estadoAreas, historialReciente }) {
           const saved = await kvGet("dia_pendientes_checked_v1");
           if (saved && typeof saved === "object") setChecked(saved);
         } else {
-          // Día nuevo de verdad, resetear checkeos y guardar nueva fecha
+          // Día nuevo de verdad, resetear checkeos (también en el servidor, porque ahora
+          // cada palomita se guarda mezclando con lo que ya hay) y guardar nueva fecha
           setChecked({});
+          await kvSet("dia_pendientes_checked_v1", { __fecha: hoyStr });
           await kvSet("dia_pendientes_checked_lastDate", hoyStr);
         }
       } catch (e) {
@@ -1611,17 +1768,9 @@ function PendientesTab({ items, estadoAreas, historialReciente }) {
     })();
   }, []);
 
-  // Guardar cambios de checkeos a Supabase
-  useEffect(() => {
-    if (cargandoChecked || Object.keys(checked).length === 0) return;
-    (async () => {
-      try {
-        await storageSetRetry("dia_pendientes_checked_v1", checked);
-      } catch (e) {
-        console.error("Error guardando pendientes:", e);
-      }
-    })();
-  }, [checked, cargandoChecked]);
+  // (Antes aquí se guardaba la lista COMPLETA de palomitas cada vez que cambiaba algo, y
+  // dos teléfonos se borraban las marcas entre sí. Ahora cada palomita se guarda sola,
+  // mezclando — ver toggle().)
 
   // Cargar si el día de hoy ya se cerró
   useEffect(() => {
@@ -1637,29 +1786,54 @@ function PendientesTab({ items, estadoAreas, historialReciente }) {
 
   async function cerrarDia() {
     setCerrando(true);
-    const nuevo = podarPorFecha({ ...(cierreDia || {}), [hoyStr]: { cerradoEn: new Date().toISOString() } });
-    setCierreDia(nuevo);
-    try {
-      await storageSetRetry("dia_pendientes_cerrado_v1", nuevo);
-    } catch (e) {
-      console.error("Error cerrando el día:", e);
-    }
+    const cerradoEn = new Date().toISOString();
+    const aplicar = (base) => podarPorFecha({ ...(base || {}), [hoyStr]: { cerradoEn } });
+    setCierreDia((prev) => aplicar(prev));
+    const res = await guardarMezclando("dia_pendientes_cerrado_v1", aplicar);
+    if (res.ok) setCierreDia(res.value || {});
+    else console.error("Error cerrando el día:", res.error);
     setCerrando(false);
     setConfirmCerrar(false);
   }
 
   async function reabrirDia() {
     setReabriendoDia(true);
-    const nuevo = { ...(cierreDia || {}) };
-    delete nuevo[hoyStr];
-    setCierreDia(nuevo);
-    try {
-      await storageSetRetry("dia_pendientes_cerrado_v1", nuevo);
-    } catch (e) {
-      console.error("Error reabriendo el día:", e);
-    }
+    const aplicar = (base) => {
+      const nuevo = { ...(base || {}) };
+      delete nuevo[hoyStr];
+      return nuevo;
+    };
+    setCierreDia((prev) => aplicar(prev));
+    const res = await guardarMezclando("dia_pendientes_cerrado_v1", aplicar);
+    if (res.ok) setCierreDia(res.value || {});
+    else console.error("Error reabriendo el día:", res.error);
     setReabriendoDia(false);
     setConfirmReabrirDia(false);
+  }
+
+  // Reinicia el día de hoy a mano: borra los pendientes marcados, quita el cierre si lo
+  // había, y borra el conteo por área de hoy (vuelven a verse como "sin iniciar"). NO
+  // borra el inventario ni las cantidades contadas — solo el progreso/estado del día.
+  async function reiniciarDia() {
+    setReiniciando(true);
+    try {
+      setChecked({});
+      await storageSetRetry("dia_pendientes_checked_v1", {});
+
+      const quitarHoy = (base) => {
+        const nuevo = { ...(base || {}) };
+        delete nuevo[hoyStr];
+        return nuevo;
+      };
+      setCierreDia((prev) => quitarHoy(prev));
+      await guardarMezclando("dia_pendientes_cerrado_v1", quitarHoy);
+
+      if (onSaveEstadoAreas) await onSaveEstadoAreas(quitarHoy);
+    } catch (e) {
+      console.error("Error reiniciando el día:", e);
+    }
+    setReiniciando(false);
+    setConfirmReiniciar(false);
   }
 
   const pendientes = useMemo(() => {
@@ -1698,7 +1872,17 @@ function PendientesTab({ items, estadoAreas, historialReciente }) {
 
   function toggle(id) {
     if (diaCerrado) return;
-    setChecked((c) => ({ ...c, [id]: !c[id] }));
+    const nuevoValor = !checked[id];
+    setChecked((c) => ({ ...c, [id]: nuevoValor }));
+    // Solo esta palomita, mezclada con las que marcaron otros teléfonos.
+    guardarMezclando("dia_pendientes_checked_v1", (base) => {
+      const valido = base && typeof base === "object" && (base.__fecha === hoyStr || base.__fecha === undefined);
+      return { ...(valido ? base : {}), __fecha: hoyStr, [id]: nuevoValor };
+    })
+      .then((res) => {
+        if (res.ok && res.value && typeof res.value === "object") setChecked(res.value);
+        else if (!res.ok) console.error("Error guardando pendientes:", res.error);
+      });
   }
 
   const fechas = items.map((i) => i.ultimaActualizacion).filter(Boolean).sort();
@@ -1722,6 +1906,15 @@ function PendientesTab({ items, estadoAreas, historialReciente }) {
           <p style={{ fontWeight: 600, fontSize: 15 }}>Todo listo para mañana</p>
           <p style={{ fontSize: 13, color: C.inkSoft, marginTop: 4 }}>Nada por debajo de su mínimo diario.</p>
         </div>
+        <button
+          onClick={() => setConfirmReiniciar(true)}
+          disabled={reiniciando}
+          className="w-full flex items-center justify-center gap-2 py-2.5 rounded-xl font-medium text-xs mt-6 mb-2"
+          style={{ background: "transparent", border: `1px solid ${C.critical}`, color: C.critical, opacity: reiniciando ? 0.7 : 1 }}
+        >
+          {reiniciando ? <Loader2 size={13} className="animate-spin" /> : <X size={13} />}
+          {reiniciando ? "Reiniciando..." : "Reiniciar día"}
+        </button>
         {confirmCerrar && (
           <ConfirmAccion
             text="¿Cerrar el día? La lista de Mañana quedará marcada como revisada y no se podrá seguir marcando hasta que la reabras o empiece el día siguiente."
@@ -1738,6 +1931,15 @@ function PendientesTab({ items, estadoAreas, historialReciente }) {
             confirmColor={C.warn}
             onCancel={() => setConfirmReabrirDia(false)}
             onConfirm={reabrirDia}
+          />
+        )}
+        {confirmReiniciar && (
+          <ConfirmAccion
+            text='¿Reiniciar el día? Se borra el progreso de hoy (pendientes marcados, cierre del día y conteo por área — vuelven a verse como "sin iniciar"). El inventario y las cantidades contadas NO se borran. Esta acción no se puede deshacer.'
+            confirmLabel={reiniciando ? "Reiniciando..." : "Sí, reiniciar día"}
+            confirmColor={C.critical}
+            onCancel={() => setConfirmReiniciar(false)}
+            onConfirm={reiniciarDia}
           />
         )}
       </div>
@@ -1876,6 +2078,25 @@ function PendientesTab({ items, estadoAreas, historialReciente }) {
           onConfirm={reabrirDia}
         />
       )}
+
+      <button
+        onClick={() => setConfirmReiniciar(true)}
+        disabled={reiniciando}
+        className="w-full flex items-center justify-center gap-2 py-2.5 rounded-xl font-medium text-xs mt-3"
+        style={{ background: "transparent", border: `1px solid ${C.critical}`, color: C.critical, opacity: reiniciando ? 0.7 : 1 }}
+      >
+        {reiniciando ? <Loader2 size={13} className="animate-spin" /> : <X size={13} />}
+        {reiniciando ? "Reiniciando..." : "Reiniciar día"}
+      </button>
+      {confirmReiniciar && (
+        <ConfirmAccion
+          text='¿Reiniciar el día? Se borra el progreso de hoy (pendientes marcados, cierre del día y conteo por área — vuelven a verse como "sin iniciar"). El inventario y las cantidades contadas NO se borran. Esta acción no se puede deshacer.'
+          confirmLabel={reiniciando ? "Reiniciando..." : "Sí, reiniciar día"}
+          confirmColor={C.critical}
+          onCancel={() => setConfirmReiniciar(false)}
+          onConfirm={reiniciarDia}
+        />
+      )}
     </div>
   );
 }
@@ -1975,4 +2196,3 @@ function HistorialTab({ items }) {
     </div>
   );
 }
-

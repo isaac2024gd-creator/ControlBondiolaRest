@@ -155,6 +155,98 @@ async function storageSetRetry(key, value, intentos = 3) {
 
 function uid() { return Math.random().toString(36).slice(2, 10); }
 
+/* ---------- Guardado "mezclando" (varios teléfonos a la vez) ----------
+   En vez de mandar la lista completa que tenía ESTA pantalla (y chocar o pisar lo que
+   guardó otro teléfono), se lee lo más reciente del servidor, se le aplican SOLO los
+   cambios de esta persona (`aplicar(base)`) y se guarda con control de versión. Si otro
+   teléfono guardó justo en medio, se vuelve a leer y a aplicar (hasta 5 intentos), así
+   no se pierde el avance de nadie. `aplicar` debe regresar el valor nuevo completo, o
+   `undefined` si no hay nada que cambiar. */
+async function guardarMezclando(key, aplicar, tabla = "kv_store", intentos = 5) {
+  let ultimoError = null;
+  for (let i = 0; i < intentos; i++) {
+    try {
+      const { value, updatedAt } = await kvGetConVersion(key, tabla);
+      const nuevo = aplicar(value);
+      if (nuevo === undefined) return { ok: true, value, updatedAt, sinCambios: true };
+      const res = await kvSetConVersion(key, nuevo, updatedAt, tabla);
+      if (res.ok) return { ok: true, value: nuevo, updatedAt: res.updatedAt };
+      ultimoError = null; // fue choque con otro teléfono: se relee y se reaplica
+    } catch (e) {
+      ultimoError = e;
+    }
+    await sleep(150 + Math.random() * 350 * (i + 1));
+  }
+  return { ok: false, error: ultimoError || new Error("Muchos guardados al mismo tiempo, intenta de nuevo.") };
+}
+
+/* ---------- Fotos en Supabase Storage (fuera de la base de datos) ----------
+   Antes cada foto se guardaba como texto dentro del catálogo, así que CADA guardado
+   subía y bajaba todas las fotos (cientos de KB). Ahora la foto se sube una sola vez al
+   almacenamiento de archivos y en el catálogo solo queda su dirección (unos 120
+   caracteres). La imagen se ve igual: <img src> acepta ambas formas. */
+const FOTOS_BUCKET = "fotos-inventario";
+
+function esFotoEmbebida(f) {
+  return typeof f === "string" && f.startsWith("data:");
+}
+
+function dataUrlABlob(dataUrl) {
+  const [meta, b64] = dataUrl.split(",");
+  const mime = (meta.match(/data:([^;]+)/) || [])[1] || "image/jpeg";
+  const bin = atob(b64);
+  const arr = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+  return new Blob([arr], { type: mime });
+}
+
+async function subirFoto(dataUrl, carpeta) {
+  const blob = dataUrlABlob(dataUrl);
+  const ext = blob.type === "image/png" ? "png" : blob.type === "image/webp" ? "webp" : "jpg";
+  const path = `${carpeta}/${Date.now()}-${Math.random().toString(36).slice(2, 10)}.${ext}`;
+  const { error } = await supabase.storage.from(FOTOS_BUCKET).upload(path, blob, {
+    contentType: blob.type,
+    cacheControl: "31536000",
+    upsert: false,
+  });
+  if (error) throw error;
+  return supabase.storage.from(FOTOS_BUCKET).getPublicUrl(path).data.publicUrl;
+}
+
+/* Pasa al almacenamiento de archivos las fotos que todavía vengan "embebidas" en una
+   lista guardada (datos viejos, o guardados desde una versión vieja de la app que siga
+   abierta en algún teléfono). Corre en segundo plano, de a 4 fotos a la vez, y guarda
+   mezclando: solo cambia la foto si sigue siendo la misma que se subió. Regresa una
+   función para aplicar el mismo cambio a la pantalla, o null si no había nada. */
+async function migrarFotosEmbebidas(lista, key, tabla, carpeta, campoFoto = "foto") {
+  const pendientes = (lista || []).filter((i) => i && esFotoEmbebida(i[campoFoto]));
+  if (!pendientes.length) return null;
+  const cambios = {};
+  for (let i = 0; i < pendientes.length; i += 4) {
+    const lote = pendientes.slice(i, i + 4);
+    await Promise.all(lote.map(async (it) => {
+      try {
+        cambios[it.id] = { antes: it[campoFoto], url: await subirFoto(it[campoFoto], carpeta) };
+      } catch (e) { /* se reintenta la próxima vez que se abra la app */ }
+    }));
+  }
+  if (!Object.keys(cambios).length) return null;
+  const aplicar = (base) => {
+    if (!Array.isArray(base)) return undefined;
+    let algo = false;
+    const nuevo = base.map((i) => {
+      const c = i && cambios[i.id];
+      if (c && i[campoFoto] === c.antes) { algo = true; return { ...i, [campoFoto]: c.url }; }
+      return i;
+    });
+    return algo ? nuevo : undefined;
+  };
+  const res = await guardarMezclando(key, aplicar, tabla);
+  return res.ok ? (prev) => aplicar(prev) || prev : null;
+}
+
+const BORRADOR_KEY = "par_borrador_conteo_v1";
+
 function compressImage(file, maxSize = 260, quality = 0.6) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -213,24 +305,22 @@ function consolidateItems(items) {
   return Object.values(map);
 }
 
+/* Historial de conteos (para Consumo). Se guarda en segundo plano y mezclando, para no
+   hacer esperar a quien cuenta ni pisar el de otro teléfono. */
 async function appendHistorial(items, fecha) {
   try {
-    let hist = [];
-    try {
-      const val = await kvGet("historial_conteos_v2");
-      hist = val || [];
-    } catch (e) {
-      hist = [];
-    }
-    hist.push({
+    const entrada = {
       fecha,
       items: items.map((i) => ({
         nombre: i.nombre, unidad: i.unidad, categoria: i.categoria,
         proveedor: i.proveedor, area: i.area, parLevel: i.parLevel, stockActual: i.stockActual,
       })),
+    };
+    await guardarMezclando("historial_conteos_v2", (base) => {
+      let hist = Array.isArray(base) ? [...base, entrada] : [entrada];
+      if (hist.length > 30) hist = hist.slice(hist.length - 30);
+      return hist;
     });
-    if (hist.length > 30) hist = hist.slice(hist.length - 30);
-    await storageSetRetry("historial_conteos_v2", hist);
   } catch (e) {
     /* no bloquea el guardado del conteo si el historial falla */
   }
@@ -319,6 +409,11 @@ export default function Par() {
         if (value) {
           setItems(value);
           setItemsUpdatedAt(updatedAt);
+          // Fotos viejas que todavía vengan dentro del catálogo: se pasan al almacenamiento
+          // de archivos en segundo plano (una sola vez). No bloquea la pantalla.
+          migrarFotosEmbebidas(value, "par_items_v2", "kv_store", "par")
+            .then((aplicarEnPantalla) => { if (aplicarEnPantalla) setItems((prev) => (prev ? aplicarEnPantalla(prev) : prev)); })
+            .catch(() => {});
         } else {
           const fecha = new Date().toISOString();
           await kvSet("par_items_v2", SEED_ITEMS);
@@ -337,29 +432,26 @@ export default function Par() {
     setLoadError(ultimoError?.message || "No se pudo conectar con el servidor.");
   }
 
-  /* Guarda con verificación de versión: si otro dispositivo guardó algo distinto mientras
-     esta pantalla tenía datos más viejos, no se sobrescribe en silencio — se avisa y se
-     trae lo más reciente. Regresa { ok, conflicto? } para que quien llama sepa si de verdad
-     quedó guardado antes de mostrar "Guardado" o cerrar una pantalla. */
-  async function persist(newItems) {
-    setItems(newItems);
-    const res = await storageSetRetryConVersion("par_items_v2", newItems, itemsUpdatedAt);
+  /* Recibe `aplicar(base)`: SOLO los cambios de esta pantalla, que se aplican sobre lo más
+     reciente del servidor (ver guardarMezclando). Si dos teléfonos guardan a la vez, se
+     quedan los dos cambios en vez de rechazar uno. Regresa { ok } para que quien llama
+     sepa si de verdad quedó guardado antes de mostrar "Guardado" o cerrar una pantalla. */
+  async function persist(aplicar) {
+    setItems((prev) => aplicar(prev || []) || prev);
+    const res = await guardarMezclando("par_items_v2", (base) => aplicar(Array.isArray(base) ? base : []));
     if (res.ok) {
+      if (Array.isArray(res.value)) setItems(res.value);
       setItemsUpdatedAt(res.updatedAt);
       return res;
     }
-    if (res.conflicto) {
-      showToast("Alguien más acaba de guardar cambios aquí. Se actualizó la información — revisa e intenta de nuevo.");
-      try {
-        const fresh = await kvGetConVersion("par_items_v2");
-        if (fresh.value) {
-          setItems(fresh.value);
-          setItemsUpdatedAt(fresh.updatedAt);
-        }
-      } catch (e) { /* si tampoco se puede releer, se deja como está y se reintentará en el próximo guardado */ }
-      return res;
-    }
-    showToast("No se pudo guardar tras varios intentos: " + (res.error?.message || "error desconocido"));
+    showToast("No se pudo guardar tras varios intentos: " + (res.error?.message || "revisa tu conexión"));
+    try {
+      const fresh = await kvGetConVersion("par_items_v2");
+      if (fresh.value) {
+        setItems(fresh.value);
+        setItemsUpdatedAt(fresh.updatedAt);
+      }
+    } catch (e) { /* se reintentará en el próximo guardado */ }
     return res;
   }
 
@@ -411,7 +503,7 @@ export default function Par() {
           items={items}
           onCerrar={() => setShowRespaldo(false)}
           onImportar={async (nuevos) => {
-            const res = await persist(nuevos);
+            const res = await persist(() => nuevos); // reemplazo completo, a propósito
             if (res?.ok) {
               showToast("Inventario reemplazado en todos los dispositivos");
               setShowRespaldo(false);
@@ -731,7 +823,19 @@ function BottomNav({ tab, setTab, items }) {
 
 /* ---------- CONTEO TAB ---------- */
 function ConteoTab({ items, onSave, showToast }) {
-  const [draft, setDraft] = useState(() => Object.fromEntries(items.map((i) => [i.id, i.stockActual])));
+  // `draft` guarda SOLO lo tecleado que todavía no se guarda ({ idProducto: cantidad }),
+  // respaldado en el teléfono (solo del día) por si se cierra o recarga la app. Antes era
+  // una copia de todo el catálogo que se reiniciaba al llegar datos nuevos y borraba lo
+  // contado.
+  const [draft, setDraft] = useState(() => {
+    try {
+      const raw = localStorage.getItem(BORRADOR_KEY);
+      const b = raw ? JSON.parse(raw) : null;
+      if (b && b.fecha === new Date().toDateString() && b.valores && typeof b.valores === "object") return b.valores;
+    } catch (e) { /* sin respaldo */ }
+    return {};
+  });
+  const guardandoRef = useRef(false);
   const [query, setQuery] = useState("");
   const [open, setOpen] = useState({});
   const [areaActual, setAreaActual] = useState(undefined); // undefined = cargando, null = sin elegir
@@ -740,10 +844,8 @@ function ConteoTab({ items, onSave, showToast }) {
   const [guardando, setGuardando] = useState(false);
   const [guardado, setGuardado] = useState(false);
 
-  const hayCambios = items.some((i) => {
-    const val = draft[i.id];
-    return val !== undefined && val !== i.stockActual;
-  });
+  const cambiosPendientes = items.filter((i) => draft[i.id] !== undefined && draft[i.id] !== i.stockActual);
+  const hayCambios = cambiosPendientes.length > 0;
 
   useEffect(() => {
     (async () => setHistorialDia(await cargarHistorialDia()))();
@@ -759,8 +861,11 @@ function ConteoTab({ items, onSave, showToast }) {
   }
 
   useEffect(() => {
-    setDraft(Object.fromEntries(items.map((i) => [i.id, i.stockActual])));
-  }, [items]);
+    try {
+      if (Object.keys(draft).length === 0) localStorage.removeItem(BORRADOR_KEY);
+      else localStorage.setItem(BORRADOR_KEY, JSON.stringify({ fecha: new Date().toDateString(), valores: draft }));
+    } catch (e) { /* sin respaldo */ }
+  }, [draft]);
 
   useEffect(() => {
     try {
@@ -814,27 +919,33 @@ function ConteoTab({ items, onSave, showToast }) {
   }
 
   async function guardar() {
+    if (guardandoRef.current) return; // candado contra doble toque
+    guardandoRef.current = true;
     setGuardando(true);
-    const fecha = new Date().toISOString();
-    const updated = items.map((i) => {
-      const nuevoStock = draft[i.id] ?? i.stockActual;
-      const cambio = nuevoStock !== i.stockActual;
-      // Solo se marca "última actualización" en lo que de verdad se contó ahora — antes
-      // se pisaba la fecha de TODOS los productos aunque no se hubieran tocado, lo que
-      // además reiniciaba en otras áreas la lista de compras ya marcada como "comprado".
-      return cambio ? { ...i, stockActual: nuevoStock, ultimaActualizacion: fecha } : i;
-    });
-    const res = await onSave(updated);
-    setGuardando(false);
-    if (!res?.ok) {
-      // Antes se mostraba "Conteo guardado" sin esperar esta confirmación. Si el guardado
-      // real falló (o hubo conflicto con otro dispositivo), no se marca como guardado.
-      if (!res?.conflicto) showToast("No se pudo guardar el conteo: " + (res?.error?.message || "intenta de nuevo"));
-      return;
+    try {
+      const fecha = new Date().toISOString();
+      const cambios = {};
+      cambiosPendientes.forEach((i) => { cambios[i.id] = draft[i.id]; });
+      if (Object.keys(cambios).length === 0) return;
+      // Solo se marca "última actualización" en lo que de verdad se contó ahora.
+      const res = await onSave((base) => base.map((i) =>
+        Object.prototype.hasOwnProperty.call(cambios, i.id) && cambios[i.id] !== i.stockActual
+          ? { ...i, stockActual: cambios[i.id], ultimaActualizacion: fecha }
+          : i
+      ));
+      if (!res?.ok) return; // onSave ya avisó; lo tecleado sigue en pantalla para reintentar
+      setDraft((d) => {
+        const n = { ...d };
+        Object.keys(cambios).forEach((id) => { if (n[id] === cambios[id]) delete n[id]; });
+        return n;
+      });
+      appendHistorial(Array.isArray(res.value) ? res.value : items, fecha); // en segundo plano
+      setGuardado(true);
+      showToast("Conteo guardado");
+    } finally {
+      guardandoRef.current = false;
+      setGuardando(false);
     }
-    await appendHistorial(updated, fecha);
-    setGuardado(true);
-    showToast("Conteo guardado");
   }
 
   if (areaActual === undefined) {
@@ -908,7 +1019,7 @@ function ConteoTab({ items, onSave, showToast }) {
           {(open[sub] === undefined ? true : open[sub]) && (
             <div>
               {grouped[sub].map((item) => {
-                const val = draft[item.id] ?? 0;
+                const val = draft[item.id] ?? item.stockActual ?? 0;
                 const status = statusOf({ ...item, stockActual: val });
                 const s = STATUS_STYLE[status];
                 const teorico = teoricoDe(item);
@@ -1080,9 +1191,10 @@ function InventarioTab({ items, onSave, showToast }) {
   async function upsert(item) {
     setShowForm(false);
     setEditing(null);
+    const conId = item.id ? item : { ...item, id: uid() };
     const res = item.id
-      ? await onSave(items.map((i) => (i.id === item.id ? { ...i, ...item } : i)))
-      : await onSave([...items, { ...item, id: uid() }]);
+      ? await onSave((base) => base.map((i) => (i.id === conId.id ? { ...i, ...conId } : i)))
+      : await onSave((base) => (base.some((i) => i.id === conId.id) ? base : [...base, conId]));
     // persist() ya avisa si falló o hubo conflicto con otro dispositivo; solo se confirma
     // el éxito aquí para no decir "actualizado"/"agregado" antes de que de verdad se guarde.
     if (res?.ok) showToast(item.id ? "Producto actualizado" : "Producto agregado");
@@ -1090,7 +1202,7 @@ function InventarioTab({ items, onSave, showToast }) {
 
   async function remove(id) {
     setConfirmDelete(null);
-    const res = await onSave(items.filter((i) => i.id !== id));
+    const res = await onSave((base) => base.filter((i) => i.id !== id));
     if (res?.ok) showToast("Producto eliminado");
   }
 
@@ -1202,7 +1314,12 @@ function ItemForm({ initial, categorias, proveedores, areas, subareas, onCancel,
       if (dataUrl.length > 180000) {
         setError("La foto sigue muy pesada, intenta con otra o toma una de menor resolución.");
       } else {
-        setFoto(dataUrl);
+        // Se sube al almacenamiento de archivos; en el producto solo queda la dirección.
+        try {
+          setFoto(await subirFoto(dataUrl, "par"));
+        } catch (errSubida) {
+          setError("No se pudo subir la foto. Revisa tu conexión e intenta de nuevo.");
+        }
       }
     } catch (err) {
       setError("No se pudo procesar la foto, intenta con otra.");
@@ -1423,14 +1540,18 @@ function ListaTab({ items, onSave, showToast }) {
     const k = itemConsolidado.id;
     const matches = items.filter((i) => itemKeyOf(i) === k);
     const totalFaltante = matches.reduce((s, i) => s + Math.max(0, i.parLevel - i.stockActual), 0);
-    const actualizados = items.map((i) => {
-      if (itemKeyOf(i) !== k) return i;
+    // Cuánto se suma a cada producto (se reparte según lo que le faltaba a cada área).
+    const agregarPorId = {};
+    matches.forEach((i) => {
       const faltanteItem = Math.max(0, i.parLevel - i.stockActual);
       const proporcion = totalFaltante > 0 ? faltanteItem / totalFaltante : 1 / matches.length;
-      const agregar = Math.round(cantidadComprada * proporcion * 10) / 10;
-      return { ...i, stockActual: Math.round((i.stockActual + agregar) * 10) / 10 };
+      agregarPorId[i.id] = Math.round(cantidadComprada * proporcion * 10) / 10;
     });
-    const res = await onSave(actualizados);
+    // Se SUMA sobre lo más reciente del servidor (no se reemplaza), así no se pierde un
+    // conteo que otro teléfono haya guardado mientras tanto.
+    const res = await onSave((base) => base.map((i) =>
+      agregarPorId[i.id] != null ? { ...i, stockActual: Math.round((i.stockActual + agregarPorId[i.id]) * 10) / 10 } : i
+    ));
     if (!res?.ok) return; // persist() ya avisó por qué no se guardó; no se marca como comprado
     guardarChecked({ ...checked, [itemConsolidado.id]: true });
     showToast(`${itemConsolidado.nombre}: se sumaron ${fmtNum(cantidadComprada)} ${itemConsolidado.unidad} al inventario.`);
