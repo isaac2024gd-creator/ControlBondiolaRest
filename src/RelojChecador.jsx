@@ -34,6 +34,27 @@ import {
   Printer,
 } from "lucide-react";
 
+/* ---------- Botón "Atrás" (flotante y el del teléfono) ----------
+   Cada pantalla interna o ventana abierta se anota aquí mientras está abierta;
+   App.jsx usa la más reciente para regresar UN paso en lugar de salir de la app. */
+function useAtras(activo, alRegresar) {
+  const ref = useRef(alRegresar);
+  ref.current = alRegresar;
+  const on = !!activo;
+  useEffect(() => {
+    if (!on || typeof window === "undefined") return undefined;
+    const pila = (window.__bndAtras = window.__bndAtras || []);
+    const entrada = { regresar: () => { if (typeof ref.current === "function") ref.current(); } };
+    pila.push(entrada);
+    window.dispatchEvent(new Event("bnd-atras"));
+    return () => {
+      const i = pila.indexOf(entrada);
+      if (i >= 0) pila.splice(i, 1);
+      window.dispatchEvent(new Event("bnd-atras"));
+    };
+  }, [on]);
+}
+
 /* ============================================================
    CONFIGURACIÓN DE SUPABASE — proyecto compartido con PAR
    ============================================================ */
@@ -315,6 +336,113 @@ function formatMoneyNoDecimal(n) {
   return (num).toLocaleString("es-MX", { style: "currency", currency: "MXN" });
 }
 
+// ---------- periodo de nómina por calendario ----------
+// El periodo ya NO se escribe a mano: se toca un día en el calendario y se selecciona
+// solo el periodo completo que lo contiene, según la frecuencia de pago:
+// - semanal: 7 días, empezando en el día de la semana configurado (semanaInicio, 0=Dom…6=Sáb)
+// - quincenal: del 1 al 15, o del 16 al último día del mes
+// - mensual: del 1 al último día del mes
+function periodoQueContiene(dateKey, payPeriod, semanaInicio = 1) {
+  const d = new Date(dateKey + "T00:00:00");
+  if (isNaN(d)) return defaultPeriodDates(payPeriod);
+  if (payPeriod === "semanal") {
+    const ini = new Date(d);
+    ini.setDate(d.getDate() - ((d.getDay() - Number(semanaInicio) + 7) % 7));
+    const fin = new Date(ini);
+    fin.setDate(ini.getDate() + 6);
+    return { start: localDateKey(ini), end: localDateKey(fin) };
+  }
+  const y = d.getFullYear();
+  const m = d.getMonth();
+  const ultimo = new Date(y, m + 1, 0).getDate();
+  if (payPeriod === "quincenal") {
+    return d.getDate() <= 15
+      ? { start: localDateKey(new Date(y, m, 1)), end: localDateKey(new Date(y, m, 15)) }
+      : { start: localDateKey(new Date(y, m, 16)), end: localDateKey(new Date(y, m, ultimo)) };
+  }
+  return { start: localDateKey(new Date(y, m, 1)), end: localDateKey(new Date(y, m, ultimo)) };
+}
+
+// día en que empieza la semana de nómina: si el empleado ya tiene recibos, se respeta el
+// mismo ciclo (el día siguiente a donde terminó el último); si no, lunes.
+function semanaInicioPorDefecto(lastPeriodEnd) {
+  if (!lastPeriodEnd) return 1;
+  const d = new Date(lastPeriodEnd + "T00:00:00");
+  return isNaN(d) ? 1 : (d.getDay() + 1) % 7;
+}
+
+const MESES_CORTOS = ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"];
+function fechaCorta(key) {
+  if (!key) return "";
+  const [y, m, d] = key.split("-").map(Number);
+  return `${d} ${MESES_CORTOS[m - 1]} ${y}`;
+}
+
+function CalendarioPeriodo({ draft, onChange, colors }) {
+  const { ink, paper, brass, sage } = colors;
+  const [mesVista, setMesVista] = useState(() => (draft.periodStart || localDateKey()).slice(0, 7));
+  useEffect(() => {
+    if (draft.periodStart) setMesVista(draft.periodStart.slice(0, 7));
+  }, [draft.periodStart]);
+  const [y, m] = mesVista.split("-").map(Number);
+  const primero = new Date(y, m - 1, 1);
+  const diasMes = new Date(y, m, 0).getDate();
+  const huecos = primero.getDay();
+  const hoy = localDateKey();
+  const celdas = [];
+  for (let i = 0; i < huecos; i++) celdas.push(null);
+  for (let dd = 1; dd <= diasMes; dd++) celdas.push(`${mesVista}-${String(dd).padStart(2, "0")}`);
+  const elegir = (key) => onChange(periodoQueContiene(key, draft.payPeriod, draft.semanaInicio ?? 1));
+  const mover = (delta) => {
+    const nd = new Date(y, m - 1 + delta, 1);
+    setMesVista(`${nd.getFullYear()}-${String(nd.getMonth() + 1).padStart(2, "0")}`);
+  };
+  const etiquetaMes = `${["Enero","Febrero","Marzo","Abril","Mayo","Junio","Julio","Agosto","Septiembre","Octubre","Noviembre","Diciembre"][m - 1]} ${y}`;
+  return (
+    <div className="mb-3">
+      <div
+        className="text-center text-sm font-bold py-2 mb-2 rounded-sm"
+        style={{ background: ink, color: paper }}
+      >
+        {fechaCorta(draft.periodStart)} — {fechaCorta(draft.periodEnd)}
+      </div>
+      <div className="flex items-center justify-between mb-1">
+        <button onClick={() => mover(-1)} className="px-3 py-1 text-lg font-bold" style={{ color: ink }} aria-label="Mes anterior">‹</button>
+        <span className="text-xs font-bold uppercase" style={{ color: ink }}>{etiquetaMes}</span>
+        <button onClick={() => mover(1)} className="px-3 py-1 text-lg font-bold" style={{ color: ink }} aria-label="Mes siguiente">›</button>
+      </div>
+      <div className="grid grid-cols-7 gap-0.5 text-center">
+        {DAY_SHORT.map((n) => (
+          <div key={n} className="text-[9px] font-bold uppercase py-1" style={{ color: ink + "77" }}>{n}</div>
+        ))}
+        {celdas.map((key, i) => {
+          if (!key) return <div key={"h" + i} />;
+          const dentro = key >= draft.periodStart && key <= draft.periodEnd;
+          const borde = key === draft.periodStart || key === draft.periodEnd;
+          return (
+            <button
+              key={key}
+              onClick={() => elegir(key)}
+              className="py-1.5 text-xs rounded-sm"
+              style={{
+                background: borde ? ink : dentro ? brass + "88" : "#fff",
+                color: borde ? paper : ink,
+                fontWeight: dentro || key === hoy ? 700 : 400,
+                outline: key === hoy ? `1.5px solid ${sage}` : "none",
+              }}
+            >
+              {Number(key.slice(8, 10))}
+            </button>
+          );
+        })}
+      </div>
+      <p className="text-[10px] mt-1.5" style={{ color: ink + "77" }}>
+        Toca cualquier día y se marca solo el periodo {draft.payPeriod} completo que lo contiene.
+      </p>
+    </div>
+  );
+}
+
 function defaultPeriodDates(payPeriod) {
   const end = new Date();
   const start = new Date();
@@ -440,25 +568,44 @@ function validateRepartoMontoOKForDivision(monto, totalEligibleDias) {
 }
 
 // cuántas "unidades" de bono ganó el empleado en el rango, según la frecuencia:
-// por día = cada día puntual cuenta; por semana/mes = solo cuenta si TODOS los días
-// trabajados de ese bucket calificaron para bono (ni uno fuera de tolerancia)
-function computeBonoUnits(employeeId, startKey, endKey, recordsByDate, frecuencia) {
+// - por día: cada día puntual cuenta.
+// - por semana / mes: se revisa CADA día que el empleado tenía programado en su horario
+//   (no solo los días que vino). La semana/mes solo cuenta si en TODOS esos días checó
+//   entrada dentro de la tolerancia de bono. Si faltó un día programado o llegó tarde,
+//   esa semana/mes ya no cuenta. Los días de vacaciones y feriados no le quitan el bono.
+// - "semana" = bloques de 7 días contados desde el inicio del periodo de nómina; un bloque
+//   incompleto (p. ej. el sobrante de una quincena) no cuenta como semana.
+// Devuelve { units, total, fallas: ["Lun 06", ...] } para poder explicar el resultado.
+function computeBonoUnits(employee, startKey, endKey, recordsByDate, frecuencia, excusados = []) {
+  const employeeId = employee?.id;
   if (frecuencia === "dia") {
-    return computeWorkedInRange(employeeId, startKey, endKey, recordsByDate).diasBono;
+    const n = computeWorkedInRange(employeeId, startKey, endKey, recordsByDate).diasBono;
+    return { units: n, total: n, fallas: [] };
   }
-  const dates = Object.keys(recordsByDate)
-    .filter((d) => d >= startKey && d <= endKey)
-    .sort();
-  const buckets = {};
-  dates.forEach((dateKey) => {
-    const entrada = (recordsByDate[dateKey] || []).find((r) => r.employeeId === employeeId && r.type === "entrada");
-    if (!entrada) return;
-    const key = bonoBucketKey(dateKey, frecuencia);
-    if (!buckets[key]) buckets[key] = { totalDias: 0, diasBono: 0 };
-    buckets[key].totalDias += 1;
-    if (entrada.punctuality === "bono") buckets[key].diasBono += 1;
-  });
-  return Object.values(buckets).filter((b) => b.totalDias > 0 && b.diasBono === b.totalDias).length;
+  const start = new Date(startKey + "T00:00:00");
+  const end = new Date(endKey + "T00:00:00");
+  if (isNaN(start) || isNaN(end) || start > end) return { units: 0, total: 0, fallas: [] };
+  const excusadosSet = new Set(excusados);
+  const buckets = {}; // key -> { programados, aTiempo, dias }
+  let idx = 0;
+  for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1), idx++) {
+    const key = localDateKey(d);
+    const bucketKey = frecuencia === "semana" ? `S${Math.floor(idx / 7)}` : key.slice(0, 7);
+    if (!buckets[bucketKey]) buckets[bucketKey] = { programados: 0, aTiempo: 0, dias: 0, fallas: [] };
+    const b = buckets[bucketKey];
+    b.dias += 1;
+    const programado = !!getScheduleForDate(employee, key)?.[d.getDay()]?.enabled;
+    if (!programado || excusadosSet.has(key)) continue;
+    b.programados += 1;
+    const entrada = (recordsByDate[key] || []).find((r) => r.employeeId === employeeId && r.type === "entrada");
+    if (entrada && entrada.punctuality === "bono") b.aTiempo += 1;
+    else b.fallas.push(`${DAY_SHORT[d.getDay()]} ${key.slice(8, 10)}${entrada ? " (tarde)" : " (faltó)"}`);
+  }
+  let lista = Object.values(buckets);
+  if (frecuencia === "semana") lista = lista.filter((b) => b.dias === 7);
+  const units = lista.filter((b) => b.programados > 0 && b.aTiempo === b.programados).length;
+  const fallas = lista.flatMap((b) => b.fallas);
+  return { units, total: lista.length, fallas };
 }
 
 // pago correspondiente a UN día no trabajado marcado como vacaciones.
@@ -1652,9 +1799,20 @@ function PayrollPanel({
   if (!employee || !draft) return null;
 
   const worked = computeWorkedInRange(employee.id, draft.periodStart, draft.periodEnd, recordsByDate);
-  const bonoUnits = draft.enableBono
-    ? computeBonoUnits(employee.id, draft.periodStart, draft.periodEnd, recordsByDate, draft.bonoFrecuencia || "dia")
-    : 0;
+  const bonoInfo = draft.enableBono
+    ? computeBonoUnits(
+        employee,
+        draft.periodStart,
+        draft.periodEnd,
+        recordsByDate,
+        draft.bonoFrecuencia || "dia",
+        [
+          ...(draft.enableVacaciones ? draft.vacacionesFechas || [] : []),
+          ...getFeriadosEnRango(draft.periodStart, draft.periodEnd, feriadosCatalogo).map((f) => f.fecha),
+        ]
+      )
+    : { units: 0, total: 0, fallas: [] };
+  const bonoUnits = bonoInfo.units;
   // la propina ya NO se captura a mano: se suma sola de lo que Propinas ya repartió y
   // guardó para este empleado dentro del periodo de nómina
   const propinaAuto = draft.enablePropina
@@ -1911,7 +2069,11 @@ function PayrollPanel({
           </span>
           <select
             value={draft.payPeriod}
-            onChange={(e) => onChange({ payPeriod: e.target.value })}
+            onChange={(e) => {
+              const pp = e.target.value;
+              const per = periodoQueContiene(draft.periodStart || localDateKey(), pp, draft.semanaInicio ?? 1);
+              onChange({ payPeriod: pp, periodStart: per.start, periodEnd: per.end });
+            }}
             className="flex-1 px-2 py-1.5 rounded-sm text-xs outline-none"
             style={{ border: `1px solid ${ink}33`, background: "#fff", color: ink }}
           >
@@ -1920,6 +2082,27 @@ function PayrollPanel({
             <option value="mensual">Mensual</option>
           </select>
         </div>
+        {draft.payPeriod === "semanal" && (
+          <div className="flex items-center gap-2 mb-3">
+            <span className="text-xs" style={{ color: ink + "88" }}>
+              La semana empieza en:
+            </span>
+            <select
+              value={draft.semanaInicio ?? 1}
+              onChange={(e) => {
+                const si = Number(e.target.value);
+                const per = periodoQueContiene(draft.periodStart || localDateKey(), "semanal", si);
+                onChange({ semanaInicio: si, periodStart: per.start, periodEnd: per.end });
+              }}
+              className="flex-1 px-2 py-1.5 rounded-sm text-xs outline-none"
+              style={{ border: `1px solid ${ink}33`, background: "#fff", color: ink }}
+            >
+              {DAY_NAMES.map((n, i) => (
+                <option key={i} value={i}>{n}</option>
+              ))}
+            </select>
+          </div>
+        )}
         <button
           onClick={onSaveConfig}
           className="w-full py-2 rounded-sm font-bold text-xs uppercase"
@@ -1934,30 +2117,7 @@ function PayrollPanel({
         <div className="text-[11px] font-bold uppercase mb-3" style={{ color: ink, letterSpacing: "0.05em" }}>
           Periodo a calcular
         </div>
-        <div className="flex items-center gap-2 mb-3">
-          <input
-            type="date"
-            value={draft.periodStart}
-            onChange={(e) => onChange({ periodStart: e.target.value })}
-            className="flex-1 px-2 py-1.5 rounded-sm text-xs outline-none"
-            style={{ border: `1px solid ${draft.periodStart && draft.periodEnd && draft.periodStart > draft.periodEnd ? paprika : ink}33`, background: "#fff", color: ink }}
-          />
-          <span className="text-[10px]" style={{ color: ink + "66" }}>
-            a
-          </span>
-          <input
-            type="date"
-            value={draft.periodEnd}
-            onChange={(e) => onChange({ periodEnd: e.target.value })}
-            className="flex-1 px-2 py-1.5 rounded-sm text-xs outline-none"
-            style={{ border: `1px solid ${draft.periodStart && draft.periodEnd && draft.periodStart > draft.periodEnd ? paprika : ink}33`, background: "#fff", color: ink }}
-          />
-        </div>
-        {draft.periodStart && draft.periodEnd && draft.periodStart > draft.periodEnd && (
-          <p className="text-xs mb-3" style={{ color: paprika }}>
-            ⚠️ La fecha de inicio no puede ser posterior a la de fin.
-          </p>
-        )}
+        <CalendarioPeriodo draft={draft} onChange={(p) => onChange({ periodStart: p.start, periodEnd: p.end })} colors={colors} />
         <div className="grid grid-cols-2 gap-2 text-xs" style={{ color: ink }}>
           <div>
             Días trabajados: <strong>{worked.totalDias}</strong>
@@ -2020,10 +2180,23 @@ function PayrollPanel({
               />
             </div>
             {draft.bonoFrecuencia && draft.bonoFrecuencia !== "dia" && (
-              <p className="text-[10px]" style={{ color: ink + "66" }}>
-                Solo cuenta como {draft.bonoFrecuencia === "semana" ? "semana" : "mes"} perfecta si ningún
-                día trabajado quedó fuera de la tolerancia de bono.
-              </p>
+              <div className="text-[10px] space-y-1">
+                <p style={{ color: ink + "66" }}>
+                  Solo cuenta como {draft.bonoFrecuencia === "semana" ? "semana" : "mes"} perfect
+                  {draft.bonoFrecuencia === "semana" ? "a" : "o"} si llegó a tiempo TODOS los días que tenía
+                  programados en su horario (faltar o llegar tarde un solo día lo quita).
+                </p>
+                <p className="font-bold" style={{ color: bonoInfo.units > 0 ? sage : paprika }}>
+                  {bonoInfo.total === 0
+                    ? draft.bonoFrecuencia === "semana"
+                      ? "El periodo no tiene una semana completa (7 días) — no aplica bono semanal."
+                      : "Sin días para evaluar en el periodo."
+                    : `Califica: ${bonoInfo.units} de ${bonoInfo.total} ${draft.bonoFrecuencia === "semana" ? "semana(s)" : "mes(es)"}`}
+                </p>
+                {bonoInfo.fallas.length > 0 && (
+                  <p style={{ color: paprika }}>Días que lo quitaron: {bonoInfo.fallas.join(", ")}</p>
+                )}
+              </div>
             )}
 
             <div className="mt-1 pt-2" style={{ borderTop: `1px dashed ${ink}22` }}>
@@ -2883,6 +3056,14 @@ export default function RelojChecador() {
 
   // ---------- mes seleccionado en la Bitácora ----------
   const [selectedMonth, setSelectedMonth] = useState(monthKeyOf());
+  // meses con al menos un registro (más el mes actual y el seleccionado), del más nuevo al
+  // más viejo — alimenta el selector de mes de la Bitácora para ver meses anteriores.
+  const mesesConRegistros = Array.from(
+    new Set([monthKeyOf(), selectedMonth, ...Object.keys(recordsByDate).map((d) => d.slice(0, 7))])
+  )
+    .filter((mk) => /^\d{4}-\d{2}$/.test(mk))
+    .sort()
+    .reverse();
   const monthDateKeys = Object.keys(recordsByDate)
     .filter((d) => d.startsWith(selectedMonth))
     .sort()
@@ -3715,10 +3896,20 @@ export default function RelojChecador() {
     // payrollRuns está ordenado del más reciente al más viejo (se inserta al frente al
     // generar), así que el primero que coincida con este empleado es su último recibo.
     const ultimoRun = payrollRuns.find((r) => r.employeeId === employeeId);
-    const period = nextPeriodDates(payroll.payPeriod, ultimoRun?.periodEnd);
+    // periodo sugerido: el siguiente después del último recibo (o el que contiene hoy si
+    // nunca se le ha hecho uno), ya ajustado al calendario de su frecuencia de pago.
+    const semanaInicio = payroll.semanaInicio ?? semanaInicioPorDefecto(ultimoRun?.periodEnd);
+    let refDia = localDateKey();
+    if (ultimoRun?.periodEnd) {
+      const sig = new Date(ultimoRun.periodEnd + "T00:00:00");
+      sig.setDate(sig.getDate() + 1);
+      if (!isNaN(sig)) refDia = localDateKey(sig);
+    }
+    const period = periodoQueContiene(refDia, payroll.payPeriod, semanaInicio);
     setPayrollSelectedEmployeeId(employeeId);
     setPayrollDraft({
       ...payroll,
+      semanaInicio,
       periodStart: period.start,
       periodEnd: period.end,
       vacacionesFechas: [],
@@ -3776,6 +3967,7 @@ export default function RelojChecador() {
       rateType: payrollDraft.rateType,
       rateAmount: Number(payrollDraft.rateAmount) || 0,
       payPeriod: payrollDraft.payPeriod,
+      semanaInicio: payrollDraft.semanaInicio ?? 1,
       bonoPorJornada: Number(payrollDraft.bonoPorJornada) || 0,
       bonoFrecuencia: payrollDraft.bonoFrecuencia || "dia",
       toleranciaBonoMin: Number(payrollDraft.toleranciaBonoMin) || 10,
@@ -4435,6 +4627,46 @@ export default function RelojChecador() {
   const brass = "#D6A24C";
   const steel = "#8A8F86";
 
+  // ---------- Botón "Atrás": cada pantalla o ventana abierta se registra ----------
+  // (el orden de abajo es solo de lectura; Atrás siempre cierra lo último que se abrió)
+  useAtras(tab !== "checador", () => setTab("checador"));
+  useAtras(tab === "checador" && !!selectedEmployeeId && !punchModal, () => setSelectedEmployeeId(null));
+  useAtras(!!punchModal, () => { if (!punchModal?.saving) setPunchModal(null); });
+  useAtras(!!photoViewer, () => setPhotoViewer(null));
+  useAtras(!!printView, () => { setPrintView(null); setConfirmPurgeMonth(false); });
+  useAtras(confirmPurgeMonth && !printView, () => setConfirmPurgeMonth(false));
+  useAtras(showBusinessConfigEdit, () => { setShowBusinessConfigEdit(false); setBusinessConfigDraft(businessConfig); });
+  useAtras(!!payrollSelectedEmployeeId, () => closePayroll());
+  useAtras(!!payrollPrintView, () => setPayrollPrintView(null));
+  useAtras(!!confirmGeneratePayroll, () => setConfirmGeneratePayroll(null));
+  useAtras(showPayrollHistory, () => { setShowPayrollHistory(false); setPayrollHistoryFiltro(""); setConfirmDeletePayrollRunId(null); });
+  useAtras(!!confirmDeletePayrollRunId, () => setConfirmDeletePayrollRunId(null));
+  useAtras(showPropinasHistorial, () => setShowPropinasHistorial(false));
+  useAtras(!!propinasOverwriteConfirm, () => setPropinasOverwriteConfirm(null));
+  useAtras(!!propinasTicketPrompt, () => setPropinasTicketPrompt(null));
+  useAtras(!!propinasTicketView, () => setPropinasTicketView(null));
+  useAtras(showPropinasConfigEdit, () => {
+    setShowPropinasConfigEdit(false);
+    setPropinasConfigDraft({ ...propinasConfig, toleranciaMin: String(propinasConfig.toleranciaMin) });
+  });
+  useAtras(showFeriadosCatalogoEdit, () => {
+    setShowFeriadosCatalogoEdit(false);
+    setFeriadosCatalogoDraft(feriadosCatalogo);
+    setNuevoFeriadoFecha("");
+    setNuevoFeriadoNombre("");
+  });
+  useAtras(showAjusteManual, () => setShowAjusteManual(false));
+  useAtras(!!actaForm, () => setActaForm(null));
+  useAtras(!!actaPrintView, () => setActaPrintView(null));
+  useAtras(!!confirmDeleteActaId, () => setConfirmDeleteActaId(null));
+  useAtras(!!pinModal, () => { if (!pinModal?.busy) setPinModal(null); });
+  useAtras(!!scheduleModal, () => setScheduleModal(null));
+  useAtras(!!areasModal, () => setAreasModal(null));
+  useAtras(!!metodoModal, () => { if (!metodoModal?.enrolling) setMetodoModal(null); });
+  useAtras(confirmDeleteId != null, () => setConfirmDeleteId(null));
+  useAtras(confirmDeleteAreaIdx != null, () => setConfirmDeleteAreaIdx(null));
+  useAtras(editingAreaIdx != null, () => setEditingAreaIdx(null));
+
   // ---------- ticket de propinas (impresora térmica 57 / 80 mm) ----------
   if (propinasTicketView) {
     const { registro: t, ancho } = propinasTicketView;
@@ -4483,7 +4715,7 @@ export default function RelojChecador() {
 
         <div
           className="no-print flex items-center justify-between gap-2 px-4 py-3"
-          style={{ position: "sticky", top: 0, background: paper, borderBottom: `1px solid ${ink}22`, zIndex: 10 }}
+          style={{ position: "sticky", top: "var(--bnd-barra, 0px)", background: paper, borderBottom: `1px solid ${ink}22`, zIndex: 10 }}
         >
           <button onClick={() => setPropinasTicketView(null)} className="text-sm font-bold" style={{ color: ink }}>
             ← Volver
@@ -4768,7 +5000,7 @@ export default function RelojChecador() {
 
         <div
           className="no-print flex items-center justify-between px-4 py-3"
-          style={{ borderBottom: `1px solid ${ink}22`, position: "sticky", top: 0, background: paper, maxWidth: 680, margin: "0 auto" }}
+          style={{ borderBottom: `1px solid ${ink}22`, position: "sticky", top: "var(--bnd-barra, 0px)", background: paper, maxWidth: 680, margin: "0 auto" }}
         >
           <button onClick={() => setPayrollPrintView(null)} className="text-sm font-bold" style={{ color: ink }}>
             ← Volver
@@ -5327,7 +5559,7 @@ export default function RelojChecador() {
 
         <div
           className="no-print flex items-center justify-between px-4 py-3"
-          style={{ borderBottom: `1px solid ${ink}22`, position: "sticky", top: 0, background: paper, maxWidth: 680, margin: "0 auto" }}
+          style={{ borderBottom: `1px solid ${ink}22`, position: "sticky", top: "var(--bnd-barra, 0px)", background: paper, maxWidth: 680, margin: "0 auto" }}
         >
           <button onClick={() => setActaPrintView(null)} className="text-sm font-bold" style={{ color: ink }}>
             ← Volver
@@ -5506,7 +5738,7 @@ export default function RelojChecador() {
 
         <div
           className="no-print flex items-center justify-between px-4 py-3"
-          style={{ borderBottom: `1px solid ${ink}22`, position: "sticky", top: 0, background: "#fff" }}
+          style={{ borderBottom: `1px solid ${ink}22`, position: "sticky", top: "var(--bnd-barra, 0px)", background: "#fff" }}
         >
           <button
             onClick={() => {
@@ -6015,23 +6247,38 @@ export default function RelojChecador() {
           <div className="flex items-center justify-between mb-1">
             <button
               onClick={() => setSelectedMonth((m) => shiftMonthKey(m, -1))}
-              className="p-1 text-lg leading-none"
-              style={{ color: steel }}
+              disabled={selectedMonth <= mesesConRegistros[mesesConRegistros.length - 1]}
+              className="px-3 py-1.5 rounded-sm text-base font-bold leading-none disabled:opacity-20"
+              style={{ color: paper, border: `1px solid ${steel}55` }}
+              aria-label="Mes anterior"
             >
               ‹
             </button>
-            <div className="text-sm font-black uppercase text-center" style={{ color: paper }}>
-              {monthLabel(selectedMonth)}
-            </div>
+            <select
+              value={selectedMonth}
+              onChange={(e) => setSelectedMonth(e.target.value)}
+              className="text-sm font-black uppercase text-center px-2 py-1.5 rounded-sm outline-none"
+              style={{ background: "transparent", color: paper, border: `1px solid ${steel}55` }}
+            >
+              {mesesConRegistros.map((mk) => (
+                <option key={mk} value={mk} style={{ color: "#000" }}>
+                  {monthLabel(mk)}
+                </option>
+              ))}
+            </select>
             <button
               onClick={() => setSelectedMonth((m) => shiftMonthKey(m, 1))}
               disabled={selectedMonth >= monthKeyOf()}
-              className="p-1 text-lg leading-none disabled:opacity-20"
-              style={{ color: steel }}
+              className="px-3 py-1.5 rounded-sm text-base font-bold leading-none disabled:opacity-20"
+              style={{ color: paper, border: `1px solid ${steel}55` }}
+              aria-label="Mes siguiente"
             >
               ›
             </button>
           </div>
+          <p className="text-[9px] text-center mb-2" style={{ color: steel }}>
+            Elige el mes para ver registros anteriores
+          </p>
 
           <div className="flex items-center justify-between mb-3">
             <div className="flex items-center gap-1.5">

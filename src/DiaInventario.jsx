@@ -6,6 +6,27 @@ import {
   Pencil, Save, Camera, TrendingUp, BarChart2, Lock,
 } from "lucide-react";
 
+/* ---------- Botón "Atrás" (flotante y el del teléfono) ----------
+   Cada pantalla interna o ventana abierta se anota aquí mientras está abierta;
+   App.jsx usa la más reciente para regresar UN paso en lugar de salir de la app. */
+function useAtras(activo, alRegresar) {
+  const ref = useRef(alRegresar);
+  ref.current = alRegresar;
+  const on = !!activo;
+  useEffect(() => {
+    if (!on || typeof window === "undefined") return undefined;
+    const pila = (window.__bndAtras = window.__bndAtras || []);
+    const entrada = { regresar: () => { if (typeof ref.current === "function") ref.current(); } };
+    pila.push(entrada);
+    window.dispatchEvent(new Event("bnd-atras"));
+    return () => {
+      const i = pila.indexOf(entrada);
+      if (i >= 0) pila.splice(i, 1);
+      window.dispatchEvent(new Event("bnd-atras"));
+    };
+  }, [on]);
+}
+
 /* Mismo proyecto Supabase que PAR y Reloj Checador — tabla propia para DÍA */
 const SUPABASE_URL = "https://ciwfhbpcpygubsvtmwze.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_AF_54iVTwT25rhMrhWbFXQ_oW2z_NeF";
@@ -637,6 +658,9 @@ export default function DiaInventario() {
     return res;
   }
 
+  // Atrás: desde Inventario / Pendientes / Historial regresa a Conteo.
+  useAtras(tab !== "conteo", () => setTab("conteo"));
+
   if (loadError) {
     return (
       <div className="w-full h-screen flex flex-col items-center justify-center px-8 text-center" style={{ background: C.bg }}>
@@ -795,6 +819,9 @@ function ConteoTab({ items, onSave, showToast, estadoAreas, onSaveEstadoAreas, h
     setCambiandoArea(false);
     try { localStorage.setItem("dia_area_actual", area); } catch (e) {}
   }
+
+  // Atrás dentro de un área: regresa a la lista de áreas.
+  useAtras(areaActual != null && !cambiandoArea, () => setCambiandoArea(true));
 
   const areasDisponibles = useMemo(() => Array.from(new Set(items.map((i) => i.area).filter(Boolean))), [items]);
   const sinArea = items.some((i) => !i.area);
@@ -1270,6 +1297,7 @@ function InventarioTab({ items, onSave, showToast }) {
 }
 
 function ItemForm({ initial, categorias, areas, subareas, onCancel, onSubmit }) {
+  useAtras(true, onCancel);
   const [nombre, setNombre] = useState(initial?.nombre || "");
   const [categoria, setCategoria] = useState(initial?.categoria || categorias[0] || "");
   const [categoriaNueva, setCategoriaNueva] = useState("");
@@ -1585,6 +1613,7 @@ function ItemForm({ initial, categorias, areas, subareas, onCancel, onSubmit }) 
 }
 
 function ImportarParModal({ onCerrar, onElegir, titulo = "Importar desde PAR" }) {
+  useAtras(true, onCerrar);
   const [productos, setProductos] = useState(null);
   const [query, setQuery] = useState("");
 
@@ -1664,6 +1693,7 @@ const fieldLabel = { fontSize: 12, color: C.inkSoft, fontWeight: 600, marginBott
 const fieldInput = { border: `1px solid ${C.line}`, background: C.bg, outline: "none" };
 
 function ConfirmSheet({ text, onCancel, onConfirm }) {
+  useAtras(true, onCancel);
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center px-6" style={{ background: "rgba(34,31,26,0.45)" }} onClick={onCancel}>
       <div className="w-full rounded-2xl p-5" style={{ background: C.paper, maxWidth: 340 }} onClick={(e) => e.stopPropagation()}>
@@ -1681,6 +1711,7 @@ function ConfirmSheet({ text, onCancel, onConfirm }) {
    botón de confirmar son configurables — ConfirmSheet queda tal cual para no afectar el
    flujo de "eliminar producto" que ya usa). */
 function ConfirmAccion({ text, confirmLabel, confirmColor, onCancel, onConfirm }) {
+  useAtras(true, onCancel);
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center px-6" style={{ background: "rgba(34,31,26,0.45)" }} onClick={onCancel}>
       <div className="w-full rounded-2xl p-5" style={{ background: C.paper, maxWidth: 340 }} onClick={(e) => e.stopPropagation()}>

@@ -5,6 +5,27 @@ import {
   Camera, Plus, Trash2, User, Lock, Printer,
 } from "lucide-react";
 
+/* ---------- Botón "Atrás" (flotante y el del teléfono) ----------
+   Cada pantalla interna o ventana abierta se anota aquí mientras está abierta;
+   App.jsx usa la más reciente para regresar UN paso en lugar de salir de la app. */
+function useAtras(activo, alRegresar) {
+  const ref = useRef(alRegresar);
+  ref.current = alRegresar;
+  const on = !!activo;
+  useEffect(() => {
+    if (!on || typeof window === "undefined") return undefined;
+    const pila = (window.__bndAtras = window.__bndAtras || []);
+    const entrada = { regresar: () => { if (typeof ref.current === "function") ref.current(); } };
+    pila.push(entrada);
+    window.dispatchEvent(new Event("bnd-atras"));
+    return () => {
+      const i = pila.indexOf(entrada);
+      if (i >= 0) pila.splice(i, 1);
+      window.dispatchEvent(new Event("bnd-atras"));
+    };
+  }, [on]);
+}
+
 /* Mismo proyecto Supabase que PAR, DÍA y Reloj Checador — tabla propia de Limpieza */
 const SUPABASE_URL = "https://ciwfhbpcpygubsvtmwze.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_AF_54iVTwT25rhMrhWbFXQ_oW2z_NeF";
@@ -583,6 +604,12 @@ function LimpiezaTab({ showToast, autoGerente = false }) {
     try { localStorage.setItem("dia_area_actual", area); } catch (e) {}
   }
 
+  // Atrás dentro de un área: regresa a la lista de áreas.
+  useAtras(areaActual != null && !cambiandoArea && !modoGerente, () => setCambiandoArea(true));
+  // Atrás en Modo Gerente (entrando desde Limpieza): sale a la vista normal.
+  // Desde la tarjeta "Gerente" del menú no se registra, así Atrás regresa al menú principal.
+  useAtras(modoGerente && !autoGerente, () => { setModoGerente(false); setGerentePinVerificado(""); });
+
   async function guardarNuevaTarea(tarea) {
     const nueva = { ...tarea, id: uid() };
     const aplicar = (base) => (base.some((t) => t.id === nueva.id) ? base : [...base, nueva]);
@@ -792,6 +819,7 @@ function LimpiezaTab({ showToast, autoGerente = false }) {
 }
 
 function CompletarTareaModal({ tarea, onCancel, onConfirm }) {
+  useAtras(true, onCancel);
   const [foto, setFoto] = useState("");
   const [quien, setQuien] = useState(() => {
     try { return localStorage.getItem("limpieza_ultimo_nombre") || ""; } catch (e) { return ""; }
@@ -878,6 +906,7 @@ function CompletarTareaModal({ tarea, onCancel, onConfirm }) {
 }
 
 function CatalogoLimpiezaModal({ tareas, areaActual, onCerrar, onAgregar, onEliminar }) {
+  useAtras(true, onCerrar);
   const [nombre, setNombre] = useState("");
   const [confirmDelete, setConfirmDelete] = useState(null);
   const [error, setError] = useState("");
@@ -1194,6 +1223,7 @@ function htmlDeLineas(lineas, cols) {
 }
 
 function ImprimirTicketsModal({ tareas, registros, areas, semanaActual, onCerrar }) {
+  useAtras(true, onCerrar);
   const [ancho, setAncho] = useState(() => {
     try { return localStorage.getItem("propinas_ticket_ancho") === "80" ? 80 : 58; } catch (e) { return 58; }
   });
@@ -1395,6 +1425,7 @@ function ImprimirTicketsModal({ tareas, registros, areas, semanaActual, onCerrar
 }
 
 function PinModalGerente({ pinModal, setPinModal, onSubmit, onCancel }) {
+  useAtras(true, onCancel);
   return (
     <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center p-4" style={{ background: "rgba(34,31,26,0.45)" }} onClick={onCancel}>
       <div className="w-full max-w-sm rounded-2xl p-5" style={{ background: C.paper }} onClick={(e) => e.stopPropagation()}>
@@ -1454,6 +1485,8 @@ function PinModalGerente({ pinModal, setPinModal, onSubmit, onCancel }) {
 
 function GerenteView({ tareas, registros, semanaActual, onSalir, pin }) {
   const [seccion, setSeccion] = useState("limpieza"); // "limpieza" | "cierre"
+  // Atrás desde "Cierre" regresa a la sección de Limpieza.
+  useAtras(seccion !== "limpieza", () => setSeccion("limpieza"));
   const [showImprimir, setShowImprimir] = useState(false);
   const semanaPasada = lunesAnterior(semanaActual);
 
@@ -1693,6 +1726,7 @@ function CierreSeccion({ pin }) {
 }
 
 function CatalogoCierreModal({ tareas, onCerrar, onAgregar, onEliminar }) {
+  useAtras(true, onCerrar);
   const [nombre, setNombre] = useState("");
   const [area, setArea] = useState(AREAS_DEFAULT[0]);
   const [confirmDelete, setConfirmDelete] = useState(null);

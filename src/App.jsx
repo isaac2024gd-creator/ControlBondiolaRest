@@ -1,5 +1,5 @@
-import React, { useState, useEffect } from "react";
-import { Clock, Package, Warehouse, Sparkles, ShieldCheck, ChevronRight, ArrowLeft } from "lucide-react";
+import React, { useState, useEffect, useRef } from "react";
+import { Clock, Package, Warehouse, Sparkles, ShieldCheck, ChevronRight, ArrowLeft, Home } from "lucide-react";
 import RelojChecador from "./RelojChecador.jsx";
 import DiaInventario from "./DiaInventario.jsx";
 import Par from "./Par.jsx";
@@ -81,20 +81,83 @@ export default function App() {
     try { localStorage.removeItem("control_bondiola_modulo"); } catch (e) {}
   }
 
+  /* ---------- Atrás inteligente ----------
+     Las pantallas internas y ventanas de cada módulo se anotan en window.__bndAtras
+     (ver useAtras en cada archivo). El botón de la barra superior y el botón/gesto de "atrás" del
+     teléfono cierran primero lo último que se abrió; si no hay nada, regresan al menú
+     principal; y en el menú principal piden tocar atrás dos veces para salir. */
+  const [hayAtras, setHayAtras] = useState(false);
+  const [aviso, setAviso] = useState("");
+  const avisoTimer = useRef(null);
+
+  useEffect(() => {
+    const actualizar = () => setHayAtras(((window.__bndAtras || []).length) > 0);
+    actualizar();
+    window.addEventListener("bnd-atras", actualizar);
+    return () => window.removeEventListener("bnd-atras", actualizar);
+  }, []);
+
+  function mostrarAviso(texto) {
+    setAviso(texto);
+    clearTimeout(avisoTimer.current);
+    avisoTimer.current = setTimeout(() => setAviso(""), 2200);
+  }
+
+  // Regresa un paso. Devuelve false si ya estamos en el menú principal.
+  function irAtras() {
+    const pila = window.__bndAtras || [];
+    if (pila.length > 0) {
+      try { pila[pila.length - 1].regresar(); } catch (e) {}
+      return true;
+    }
+    if (modulo) {
+      volverAlInicio();
+      return true;
+    }
+    return false;
+  }
+  const irAtrasRef = useRef(irAtras);
+  irAtrasRef.current = irAtras;
+
+  // Botón / gesto "atrás" del teléfono: se deja una "marca" en el historial del
+  // navegador para atraparlo, en lugar de que el navegador se salga de la app.
+  useEffect(() => {
+    let intentoSalir = 0;
+    const marcar = () => { try { window.history.pushState({ bnd: true }, ""); } catch (e) {} };
+    try { if (!(window.history.state && window.history.state.bnd)) marcar(); } catch (e) {}
+
+    function onPop() {
+      if (irAtrasRef.current()) {
+        marcar();
+        return;
+      }
+      const ahora = Date.now();
+      if (ahora - intentoSalir < 2500) {
+        try { window.history.back(); } catch (e) {}
+        return;
+      }
+      intentoSalir = ahora;
+      marcar();
+      mostrarAviso("Toca atrás otra vez para salir");
+    }
+    window.addEventListener("popstate", onPop);
+    return () => window.removeEventListener("popstate", onPop);
+  }, []);
+
   const moduloActivo = MODULOS.find((m) => m.id === modulo);
+  const avisoEl = aviso ? <AvisoFlotante texto={aviso} /> : null;
 
   if (modulo === "checador") {
     return (
-      <div className="relative">
-        <BotonVolver onClick={volverAlInicio} />
+      <ModuloShell modulo={moduloActivo} hayAtras={hayAtras} onAtras={irAtras} onMenu={volverAlInicio}>
         <RelojChecador />
-      </div>
+      </ModuloShell>
     );
   }
 
   if (modulo === "dia") {
     return (
-      <ModuloShell modulo={moduloActivo} onVolver={volverAlInicio}>
+      <ModuloShell modulo={moduloActivo} hayAtras={hayAtras} onAtras={irAtras} onMenu={volverAlInicio}>
         <DiaInventario />
       </ModuloShell>
     );
@@ -102,7 +165,7 @@ export default function App() {
 
   if (modulo === "limpieza") {
     return (
-      <ModuloShell modulo={moduloActivo} onVolver={volverAlInicio}>
+      <ModuloShell modulo={moduloActivo} hayAtras={hayAtras} onAtras={irAtras} onMenu={volverAlInicio}>
         <Limpieza />
       </ModuloShell>
     );
@@ -110,7 +173,7 @@ export default function App() {
 
   if (modulo === "par") {
     return (
-      <ModuloShell modulo={moduloActivo} onVolver={volverAlInicio}>
+      <ModuloShell modulo={moduloActivo} hayAtras={hayAtras} onAtras={irAtras} onMenu={volverAlInicio}>
         <Par />
       </ModuloShell>
     );
@@ -118,7 +181,7 @@ export default function App() {
 
   if (modulo === "gerente") {
     return (
-      <ModuloShell modulo={moduloActivo} onVolver={volverAlInicio}>
+      <ModuloShell modulo={moduloActivo} hayAtras={hayAtras} onAtras={irAtras} onMenu={volverAlInicio}>
         <Limpieza autoGerente />
       </ModuloShell>
     );
@@ -130,6 +193,7 @@ export default function App() {
       style={{ background: C.bg, fontFamily: "'Inter', sans-serif" }}
     >
       <style>{`@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500;600;700&display=swap');`}</style>
+      {avisoEl}
 
       <div style={{ maxWidth: 420, width: "100%" }}>
         <h1
@@ -182,41 +246,60 @@ export default function App() {
   );
 }
 
-/* Envuelve cada módulo (menos Checador, que ya tiene identidad propia) con una franja
-   de color arriba que coincide con la tarjeta del menú, para saber siempre dónde estás. */
-function ModuloShell({ modulo, onVolver, children }) {
+/* Envuelve cada módulo con una barra de color arriba (igual a su tarjeta del menú) que
+   incluye el botón "Atrás". La barra ocupa su propio espacio (ya no flota encima), así que
+   nunca tapa el contenido; se queda pegada arriba al hacer scroll. Las ventanas emergentes
+   de cada módulo quedan por encima de la barra (traen su propio botón de cerrar) y el
+   botón/gesto "atrás" del teléfono sigue funcionando igual. */
+const ALTO_BARRA = 48;
+function ModuloShell({ modulo, hayAtras, onAtras, onMenu, children }) {
   const Icon = modulo.icon;
+  const btn = {
+    background: "#FFFFFF1F",
+    color: modulo.texto,
+    border: "1px solid #FFFFFF33",
+  };
   return (
-    <div className="relative">
+    <div style={{ "--bnd-barra": `${ALTO_BARRA}px` }}>
       <div
-        className="w-full flex items-center gap-2 pl-16 pr-4"
-        style={{ background: modulo.bg, height: 44, position: "sticky", top: 0, zIndex: 55 }}
+        className="no-print w-full flex items-center gap-2 px-2"
+        style={{ background: modulo.bg, height: ALTO_BARRA, position: "sticky", top: 0, zIndex: 30, boxShadow: "0 1px 4px rgba(0,0,0,0.15)" }}
       >
-        <Icon size={15} color={modulo.texto} />
-        <span style={{ fontSize: 12.5, fontWeight: 700, color: modulo.texto, letterSpacing: "0.02em" }}>
-          {modulo.nombre}
-        </span>
+        <button
+          onClick={hayAtras ? onAtras : onMenu}
+          className="flex items-center gap-1.5 pl-2 pr-3 py-1.5 rounded-full text-[13px] font-bold flex-shrink-0"
+          style={btn}
+        >
+          <ArrowLeft size={16} />
+          {hayAtras ? "Atrás" : "Menú"}
+        </button>
+        <div className="flex-1 min-w-0 flex items-center justify-center gap-1.5">
+          <Icon size={14} color={modulo.texto} />
+          <span className="truncate" style={{ fontSize: 12.5, fontWeight: 700, color: modulo.texto, letterSpacing: "0.02em" }}>
+            {modulo.nombre}
+          </span>
+        </div>
+        <button
+          onClick={onMenu}
+          aria-label="Menú principal"
+          className="flex items-center justify-center rounded-full flex-shrink-0"
+          style={{ ...btn, width: 34, height: 34, visibility: hayAtras ? "visible" : "hidden" }}
+        >
+          <Home size={16} />
+        </button>
       </div>
-      <BotonVolver onClick={onVolver} />
       {children}
     </div>
   );
 }
 
-function BotonVolver({ onClick }) {
+function AvisoFlotante({ texto }) {
   return (
-    <button
-      onClick={onClick}
-      className="no-print fixed top-1.5 left-3 z-[60] flex items-center gap-2 pl-2.5 pr-4 py-2 rounded-full text-sm font-bold"
-      style={{
-        background: "#221F1A",
-        color: "#F7F3EA",
-        boxShadow: "0 4px 14px rgba(0,0,0,0.35)",
-        border: "1px solid #FFFFFF22",
-      }}
+    <div
+      className="fixed left-1/2 z-[70] px-4 py-2.5 rounded-full text-sm font-semibold"
+      style={{ bottom: 28, transform: "translateX(-50%)", background: "#221F1A", color: "#F7F3EA", boxShadow: "0 4px 14px rgba(0,0,0,0.35)", whiteSpace: "nowrap" }}
     >
-      <ArrowLeft size={16} />
-      Menú principal
-    </button>
+      {texto}
+    </div>
   );
 }

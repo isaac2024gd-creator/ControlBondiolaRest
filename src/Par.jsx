@@ -8,6 +8,27 @@ import {
   Download, Upload, Copy, ClipboardCopy, Lock
 } from "lucide-react";
 
+/* ---------- Botón "Atrás" (flotante y el del teléfono) ----------
+   Cada pantalla interna o ventana abierta se anota aquí mientras está abierta;
+   App.jsx usa la más reciente para regresar UN paso en lugar de salir de la app. */
+function useAtras(activo, alRegresar) {
+  const ref = useRef(alRegresar);
+  ref.current = alRegresar;
+  const on = !!activo;
+  useEffect(() => {
+    if (!on || typeof window === "undefined") return undefined;
+    const pila = (window.__bndAtras = window.__bndAtras || []);
+    const entrada = { regresar: () => { if (typeof ref.current === "function") ref.current(); } };
+    pila.push(entrada);
+    window.dispatchEvent(new Event("bnd-atras"));
+    return () => {
+      const i = pila.indexOf(entrada);
+      if (i >= 0) pila.splice(i, 1);
+      window.dispatchEvent(new Event("bnd-atras"));
+    };
+  }, [on]);
+}
+
 /* Mismo proyecto Supabase que Checador/DÍA/Limpieza — tabla propia de PAR */
 const SUPABASE_URL = "https://ciwfhbpcpygubsvtmwze.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_AF_54iVTwT25rhMrhWbFXQ_oW2z_NeF";
@@ -615,6 +636,9 @@ export default function Par() {
     return res;
   }
 
+  // Atrás: desde Inventario / Lista / Consumo regresa a Conteo.
+  useAtras(tab !== "conteo", () => setTab("conteo"));
+
   if (loadError) {
     return (
       <div className="w-full h-screen flex flex-col items-center justify-center px-8 text-center" style={{ background: C.bg }}>
@@ -752,6 +776,7 @@ function validarItemsImportados(parsed) {
 }
 
 function RespaldoModal({ items, onCerrar, onImportar }) {
+  useAtras(true, onCerrar);
   const [modo, setModo] = useState("exportar");
   const [texto, setTexto] = useState("");
   const [copiado, setCopiado] = useState(false);
@@ -1061,6 +1086,9 @@ function ConteoTab({ items, onSave, showToast, estadoAreas, onSaveEstadoAreas, o
     setCambiandoArea(false);
     try { localStorage.setItem("par_area_actual", area); } catch (e) {}
   }
+
+  // Atrás dentro de un área: regresa a la lista de áreas.
+  useAtras(areaActual != null && !cambiandoArea, () => setCambiandoArea(true));
 
   const areasDisponibles = useMemo(() => {
     const set = new Set(items.map((i) => i.area).filter(Boolean));
@@ -1579,6 +1607,7 @@ function AreaPicker({ areas, sinArea, onElegir, onCancelar, estadoAreas, semana,
 }
 
 function ConfirmAccion({ text, confirmLabel, confirmColor, onCancel, onConfirm }) {
+  useAtras(true, onCancel);
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center px-6" style={{ background: "rgba(34,31,26,0.45)" }} onClick={onCancel}>
       <div className="w-full rounded-2xl p-5" style={{ background: C.paper, maxWidth: 340 }} onClick={(e) => e.stopPropagation()}>
@@ -1698,6 +1727,7 @@ function InventarioTab({ items, onSave, showToast }) {
 }
 
 function ItemForm({ initial, categorias, proveedores, areas, subareas, onCancel, onSubmit }) {
+  useAtras(true, onCancel);
   const [nombre, setNombre] = useState(initial?.nombre || "");
   const [categoria, setCategoria] = useState(initial?.categoria || categorias[0] || "");
   const [categoriaNueva, setCategoriaNueva] = useState("");
@@ -1892,6 +1922,7 @@ const fieldLabel = { fontSize: 12, color: C.inkSoft, fontWeight: 600, marginBott
 const fieldInput = { border: `1px solid ${C.line}`, background: C.bg, outline: "none" };
 
 function ConfirmSheet({ text, onCancel, onConfirm }) {
+  useAtras(true, onCancel);
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center px-6" style={{ background: "rgba(34,31,26,0.45)" }} onClick={onCancel}>
       <div className="w-full rounded-2xl p-5" style={{ background: C.paper, maxWidth: 340 }} onClick={(e) => e.stopPropagation()}>
@@ -2093,6 +2124,7 @@ function ListaTab({ items, onSave, showToast }) {
 }
 
 function ComprarModal({ item, onCancelar, onConfirmar, onOmitir }) {
+  useAtras(true, onCancelar);
   const [cantidad, setCantidad] = useState(String(item.faltante));
 
   return (
