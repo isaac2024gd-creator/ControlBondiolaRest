@@ -742,8 +742,11 @@ function Header() {
 }
 
 function BottomNav({ tab, setTab, items }) {
-  const diaManana = (new Date().getDay() + 1) % 7;
-  const pendientes = items.filter((i) => i.stockActual < nivelEfectivo(i, diaManana)).length;
+  const diaHoyNav = new Date().getDay();
+  const diaManana = (diaHoyNav + 1) % 7;
+  // Solo cuentan los productos que tocan contarse HOY (los que tienen días marcados y hoy
+  // no es uno de ellos no se contaron, así que no deben pedirse para mañana).
+  const pendientes = items.filter((i) => seCuentaHoy(i, diaHoyNav) && i.stockActual < nivelEfectivo(i, diaManana)).length;
   const NavBtn = ({ id, icon: Icon, label, badge }) => {
     const active = tab === id;
     return (
@@ -1958,7 +1961,11 @@ function PendientesTab({ items, estadoAreas, historialReciente, onSaveEstadoArea
   }
 
   const pendientes = useMemo(() => {
+    // Igual que en Conteo: si el producto tiene días marcados y hoy no es uno de ellos,
+    // no se contó hoy y no debe aparecer en la lista de Mañana.
+    const diaHoyLista = (diaManana + 6) % 7;
     return items
+      .filter((i) => seCuentaHoy(i, diaHoyLista))
       .map((i) => ({ ...i, minimoManana: nivelEfectivo(i, diaManana) }))
       .filter((i) => i.stockActual < i.minimoManana)
       .map((i) => ({ ...i, faltante: roundQty(i.minimoManana - i.stockActual, i.unidad) }));
