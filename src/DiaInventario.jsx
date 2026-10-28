@@ -5,6 +5,7 @@ import {
   ChevronDown, ChevronRight, Check, X, AlertTriangle, Loader2,
   Pencil, Save, Camera, TrendingUp, BarChart2, Lock,
 } from "lucide-react";
+import { ComidaPersonalManana } from "./ComidaPersonal.jsx";
 
 /* ---------- Botón "Atrás" (flotante y el del teléfono) ----------
    Cada pantalla interna o ventana abierta se anota aquí mientras está abierta;
@@ -2034,6 +2035,9 @@ function PendientesTab({ items, estadoAreas, historialReciente, onSaveEstadoArea
           <p style={{ fontWeight: 600, fontSize: 15 }}>Todo listo para mañana</p>
           <p style={{ fontSize: 13, color: C.inkSoft, marginTop: 4 }}>Nada por debajo de su mínimo diario.</p>
         </div>
+        {/* Comida de personal de mañana (módulo Comida de personal) */}
+        <ComidaPersonalManana />
+
         <button
           onClick={() => setConfirmReiniciar(true)}
           disabled={reiniciando}
@@ -2206,6 +2210,9 @@ function PendientesTab({ items, estadoAreas, historialReciente, onSaveEstadoArea
           onConfirm={reabrirDia}
         />
       )}
+
+      {/* Comida de personal de mañana (módulo Comida de personal) */}
+      <ComidaPersonalManana />
 
       <button
         onClick={() => setConfirmReiniciar(true)}

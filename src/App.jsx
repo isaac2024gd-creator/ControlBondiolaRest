@@ -1,9 +1,10 @@
 import React, { useState, useEffect, useRef } from "react";
-import { Clock, Package, Warehouse, Sparkles, ShieldCheck, ChevronRight, ArrowLeft, Home } from "lucide-react";
+import { Clock, Package, Warehouse, Sparkles, ShieldCheck, ChevronRight, ArrowLeft, Home, UtensilsCrossed } from "lucide-react";
 import RelojChecador from "./RelojChecador.jsx";
 import DiaInventario from "./DiaInventario.jsx";
 import Par from "./Par.jsx";
 import Limpieza from "./Limpieza.jsx";
+import ComidaPersonal from "./ComidaPersonal.jsx";
 
 const C = {
   bg: "#F7F3EC",
@@ -50,6 +51,15 @@ const MODULOS = [
     bg: "#B23A2E",
     texto: "#FFFFFF",
     sub: "#F1D2CD",
+  },
+  {
+    id: "comida",
+    nombre: "Comida de personal",
+    subtitulo: "Qué toca desayunar y comer hoy, con receta por personas",
+    icon: UtensilsCrossed,
+    bg: "#A8641C",
+    texto: "#FFFFFF",
+    sub: "#F3DEC4",
   },
   {
     id: "gerente",
@@ -175,6 +185,14 @@ export default function App() {
     return (
       <ModuloShell modulo={moduloActivo} hayAtras={hayAtras} onAtras={irAtras} onMenu={volverAlInicio}>
         <Par />
+      </ModuloShell>
+    );
+  }
+
+  if (modulo === "comida") {
+    return (
+      <ModuloShell modulo={moduloActivo} hayAtras={hayAtras} onAtras={irAtras} onMenu={volverAlInicio}>
+        <ComidaPersonal />
       </ModuloShell>
     );
   }

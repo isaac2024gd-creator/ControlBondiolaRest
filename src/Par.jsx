@@ -1636,6 +1636,10 @@ function InventarioTab({ items, onSave, showToast }) {
 
   const filtered = items.filter((i) => i.nombre.toLowerCase().includes(query.trim().toLowerCase()));
 
+  // Último precio pagado de cada insumo (sin IVA), registrado desde la lista de compras.
+  const [precios, setPrecios] = useState({});
+  useEffect(() => { cargarPreciosVigentes().then(setPrecios).catch(() => {}); }, []);
+
   async function upsert(item) {
     setShowForm(false);
     setEditing(null);
@@ -1687,6 +1691,11 @@ function InventarioTab({ items, onSave, showToast }) {
             {item.ultimaActualizacion && (
               <div style={{ fontSize: 10.5, color: C.inkSoft, opacity: 0.75, marginTop: 1 }}>
                 Contado: {formatFecha(item.ultimaActualizacion)}
+              </div>
+            )}
+            {precios[insumoKeyOf(item)] && (
+              <div style={{ fontSize: 11, color: C.accent, fontWeight: 600, marginTop: 1, fontFamily: "'IBM Plex Mono', monospace" }}>
+                {fmtMoneda(precios[insumoKeyOf(item)].costo_unitario)}/{item.unidad} sin IVA · {formatFecha(precios[insumoKeyOf(item)].creado_en)}
               </div>
             )}
           </div>
@@ -1941,6 +1950,56 @@ function itemKeyOf(i) {
   return `${i.nombre.trim().toLowerCase()}|${i.unidad}|${(i.proveedor || "").trim().toLowerCase()}`;
 }
 
+/* ---------- COSTEO: compras con costo y presentación ----------
+   Cada compra (o "omitido") se guarda como una fila en la tabla `costeo_compras`
+   (Supabase), así todos los teléfonos ven la misma lista tachada y el costo queda
+   registrado para la página de Costeo. Los costos se guardan SIN IVA.
+   `insumo_key` = "nombre|unidad" (mismo formato que usa DÍA en sus recetas). */
+const IVA = 0.16;
+
+function insumoKeyOf(i) {
+  return `${i.nombre.trim().toLowerCase()}|${i.unidad}`;
+}
+
+function fmtMoneda(n) {
+  if (n == null || isNaN(n)) return "—";
+  return "$" + Number(n).toLocaleString("es-MX", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+// Producción interna (la hace la cocina, no se compra): categoría Producción sin proveedor.
+function esProduccionInterna(item) {
+  return item.categoria === "Producción" && !(item.proveedor || "").trim();
+}
+
+async function cargarComprasDeLista(listaFecha) {
+  const { data, error } = await supabase
+    .from("costeo_compras")
+    .select("id, linea_key, estado, costo_total, cantidad_unidades, creado_en")
+    .eq("lista_fecha", listaFecha)
+    .neq("estado", "anulado")
+    .order("creado_en", { ascending: true });
+  if (error) throw error;
+  return data || [];
+}
+
+async function cargarPresentaciones() {
+  const { data, error } = await supabase
+    .from("costeo_presentaciones")
+    .select("id, insumo_key, nombre, contenido, creado_en");
+  if (error) throw error;
+  return data || [];
+}
+
+async function cargarPreciosVigentes() {
+  const { data, error } = await supabase
+    .from("costeo_precios_vigentes")
+    .select("insumo_key, costo_unitario, precio_anterior, creado_en, presentacion_nombre");
+  if (error) throw error;
+  const map = {};
+  (data || []).forEach((r) => { map[r.insumo_key] = r; });
+  return map;
+}
+
 function ListaTab({ items, onSave, showToast }) {
   const consolidados = useMemo(() => consolidateItems(items), [items]);
 
@@ -1953,66 +2012,154 @@ function ListaTab({ items, onSave, showToast }) {
 
   const fechasConteo = items.map((i) => i.ultimaActualizacion).filter(Boolean).sort();
   const fechaConteo = fechasConteo.length ? fechasConteo[fechasConteo.length - 1] : null;
-  const storageKey = `par_lista_checked_${fechaConteo || "sin_fecha"}`;
+  const listaFecha = fechaConteo || "sin_fecha";
+  const storageKey = `par_lista_checked_${listaFecha}`;
 
-  const [checked, setChecked] = useState(() => {
-    try {
-      const saved = localStorage.getItem(storageKey);
-      return saved ? JSON.parse(saved) : {};
-    } catch (e) {
-      return {};
-    }
-  });
-  const [comprando, setComprando] = useState(null); // item consolidado en proceso de registrar compra
+  // Tachados viejos guardados solo en este teléfono (antes del costeo). Se siguen mostrando
+  // como respaldo, pero lo que manda es lo guardado en el servidor.
+  const [checkedLocal, setCheckedLocal] = useState({});
+  const [compras, setCompras] = useState([]); // filas de costeo_compras de esta lista
+  const [presentaciones, setPresentaciones] = useState([]);
+  const [precios, setPrecios] = useState({});
+  const [cargandoServidor, setCargandoServidor] = useState(true);
+  const [comprando, setComprando] = useState(null); // línea en proceso de registrar compra
+  const [desmarcando, setDesmarcando] = useState(null);
 
-  // si cambia el conteo (nueva semana), la lista de tachados también cambia de "cajón"
   useEffect(() => {
     try {
       const saved = localStorage.getItem(storageKey);
-      setChecked(saved ? JSON.parse(saved) : {});
+      setCheckedLocal(saved ? JSON.parse(saved) : {});
     } catch (e) {
-      setChecked({});
+      setCheckedLocal({});
     }
+    recargarServidor();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [storageKey]);
 
-  function guardarChecked(nuevo) {
-    setChecked(nuevo);
+  async function recargarServidor() {
+    setCargandoServidor(true);
+    try {
+      const [c, p, pr] = await Promise.all([cargarComprasDeLista(listaFecha), cargarPresentaciones(), cargarPreciosVigentes()]);
+      setCompras(c);
+      setPresentaciones(p);
+      setPrecios(pr);
+    } catch (e) {
+      showToast("No se pudieron cargar los costos: " + (e?.message || "revisa tu conexión"));
+    }
+    setCargandoServidor(false);
+  }
+
+  // Estado de cada línea: la última fila del servidor manda; si no hay, el tachado viejo local.
+  const estadoPorLinea = useMemo(() => {
+    const m = {};
+    Object.entries(checkedLocal).forEach(([k, v]) => { if (v) m[k] = { estado: v === "omitido" ? "omitido" : "comprado", local: true }; });
+    compras.forEach((c) => { m[c.linea_key] = { estado: c.estado, costo: c.costo_total, id: c.id }; });
+    return m;
+  }, [compras, checkedLocal]);
+
+  function quitarLocal(id) {
+    if (!checkedLocal[id]) return;
+    const nuevo = { ...checkedLocal };
+    delete nuevo[id];
+    setCheckedLocal(nuevo);
     try { localStorage.setItem(storageKey, JSON.stringify(nuevo)); } catch (e) {}
   }
 
-  function destacharSinComprar(id) {
-    guardarChecked({ ...checked, [id]: false });
+  async function insertarFila(fila) {
+    const { data, error } = await supabase.from("costeo_compras").insert(fila).select("id, linea_key, estado, costo_total, cantidad_unidades, creado_en").single();
+    if (error) throw error;
+    return data;
   }
 
-  // "Omitir": se tacha de la lista SIN sumar nada al inventario (no se compró ni se
-  // produjo esta vez). Se distingue de "comprado" y se puede deshacer tocándolo otra vez.
-  function omitir(item) {
+  // Desmarcar: se ANULA la fila (queda el registro, pero ya no cuenta para el costo).
+  // El inventario no cambia (igual que antes).
+  async function confirmarDesmarcar(item) {
+    setDesmarcando(null);
+    const ids = compras.filter((c) => c.linea_key === item.id).map((c) => c.id);
+    if (ids.length) {
+      const { error } = await supabase.from("costeo_compras").update({ estado: "anulado", anulado_en: new Date().toISOString() }).in("id", ids);
+      if (error) {
+        showToast("No se pudo desmarcar: " + error.message);
+        return;
+      }
+      setCompras((prev) => prev.filter((c) => !ids.includes(c.id)));
+    }
+    quitarLocal(item.id);
+    recargarPrecios();
+    showToast(`${item.nombre}: desmarcado. El inventario no cambió.`);
+  }
+
+  async function recargarPrecios() {
+    try { setPrecios(await cargarPreciosVigentes()); } catch (e) {}
+  }
+
+  // "Omitir": se tacha de la lista SIN sumar nada al inventario ni registrar costo.
+  async function omitir(item) {
     setComprando(null);
-    guardarChecked({ ...checked, [item.id]: "omitido" });
-    showToast(`${item.nombre}: omitido de esta lista (no se sumó nada al inventario).`);
+    try {
+      const fila = await insertarFila({
+        lista_fecha: listaFecha, linea_key: item.id, insumo_key: insumoKeyOf(item),
+        nombre: item.nombre, unidad: item.unidad, proveedor: item.proveedor || null, estado: "omitido",
+      });
+      setCompras((prev) => [...prev, fila]);
+      showToast(`${item.nombre}: omitido de esta lista (no se sumó nada al inventario).`);
+    } catch (e) {
+      showToast("No se pudo guardar: " + (e?.message || "revisa tu conexión"));
+    }
   }
 
-  async function registrarCompra(itemConsolidado, cantidadComprada) {
+  /* datos = { cantidadPresentaciones, presentacion: { nombre, contenido, nueva }, costoTotal, conIva, produccion } */
+  async function registrarCompra(itemConsolidado, datos) {
+    const unidades = Math.round(datos.cantidadPresentaciones * datos.presentacion.contenido * 1000) / 1000;
+    const costoSinIva = datos.produccion ? null : (datos.conIva ? datos.costoTotal / (1 + IVA) : datos.costoTotal);
+    const costoUnitario = costoSinIva != null && unidades > 0 ? costoSinIva / unidades : null;
+
+    // 1) Primero se guarda la compra (con su costo). Si falla, no se toca el inventario.
+    let fila;
+    try {
+      fila = await insertarFila({
+        lista_fecha: listaFecha, linea_key: itemConsolidado.id, insumo_key: insumoKeyOf(itemConsolidado),
+        nombre: itemConsolidado.nombre, unidad: itemConsolidado.unidad, proveedor: itemConsolidado.proveedor || null,
+        estado: "comprado",
+        presentacion_nombre: datos.presentacion.nombre, contenido: datos.presentacion.contenido,
+        cantidad_presentaciones: datos.cantidadPresentaciones, cantidad_unidades: unidades,
+        costo_total: costoSinIva != null ? Math.round(costoSinIva * 100) / 100 : null,
+        costo_unitario: costoUnitario != null ? Math.round(costoUnitario * 10000) / 10000 : null,
+        ticket_con_iva: !!datos.conIva,
+      });
+    } catch (e) {
+      showToast("No se guardó la compra: " + (e?.message || "revisa tu conexión"));
+      return;
+    }
+    if (datos.presentacion.nueva) {
+      supabase.from("costeo_presentaciones")
+        .upsert({ insumo_key: insumoKeyOf(itemConsolidado), nombre: datos.presentacion.nombre, contenido: datos.presentacion.contenido }, { onConflict: "insumo_key,nombre", ignoreDuplicates: true })
+        .then(() => cargarPresentaciones().then(setPresentaciones).catch(() => {}));
+    }
+
+    // 2) Se suma al inventario, repartido según lo que le faltaba a cada área.
     setComprando(null);
     const k = itemConsolidado.id;
     const matches = items.filter((i) => itemKeyOf(i) === k);
     const totalFaltante = matches.reduce((s, i) => s + Math.max(0, i.parLevel - i.stockActual), 0);
-    // Cuánto se suma a cada producto (se reparte según lo que le faltaba a cada área).
     const agregarPorId = {};
     matches.forEach((i) => {
       const faltanteItem = Math.max(0, i.parLevel - i.stockActual);
       const proporcion = totalFaltante > 0 ? faltanteItem / totalFaltante : 1 / matches.length;
-      agregarPorId[i.id] = Math.round(cantidadComprada * proporcion * 10) / 10;
+      agregarPorId[i.id] = Math.round(unidades * proporcion * 10) / 10;
     });
-    // Se SUMA sobre lo más reciente del servidor (no se reemplaza), así no se pierde un
-    // conteo que otro teléfono haya guardado mientras tanto.
+    // Se SUMA sobre lo más reciente del servidor (no se reemplaza).
     const res = await onSave((base) => base.map((i) =>
       agregarPorId[i.id] != null ? { ...i, stockActual: Math.round((i.stockActual + agregarPorId[i.id]) * 10) / 10 } : i
     ));
-    if (!res?.ok) return; // persist() ya avisó por qué no se guardó; no se marca como comprado
-    guardarChecked({ ...checked, [itemConsolidado.id]: true });
-    showToast(`${itemConsolidado.nombre}: se sumaron ${fmtNum(cantidadComprada)} ${itemConsolidado.unidad} al inventario.`);
+    if (!res?.ok) {
+      // El inventario no se guardó: se anula la compra para no dejar un costo "huérfano".
+      await supabase.from("costeo_compras").update({ estado: "anulado", anulado_en: new Date().toISOString() }).eq("id", fila.id);
+      return; // persist() ya avisó por qué no se guardó
+    }
+    setCompras((prev) => [...prev, fila]);
+    recargarPrecios();
+    showToast(`${itemConsolidado.nombre}: +${fmtNum(unidades)} ${itemConsolidado.unidad}${costoSinIva != null ? ` · ${fmtMoneda(costoSinIva)} sin IVA` : ""}`);
   }
 
   const porProveedor = useMemo(() => {
@@ -2025,9 +2172,10 @@ function ListaTab({ items, onSave, showToast }) {
     return map;
   }, [necesarios]);
 
-  const comprados = necesarios.filter((i) => checked[i.id] === true).length;
-  const omitidos = necesarios.filter((i) => checked[i.id] === "omitido").length;
+  const comprados = necesarios.filter((i) => estadoPorLinea[i.id]?.estado === "comprado").length;
+  const omitidos = necesarios.filter((i) => estadoPorLinea[i.id]?.estado === "omitido").length;
   const resueltos = comprados + omitidos;
+  const gastoLista = compras.filter((c) => c.estado === "comprado").reduce((s, c) => s + (Number(c.costo_total) || 0), 0);
 
   if (necesarios.length === 0) {
     return (
@@ -2057,6 +2205,12 @@ function ListaTab({ items, onSave, showToast }) {
           {resueltos}/{necesarios.length} resueltos · {comprados} comprado{comprados === 1 ? "" : "s"}
           {omitidos > 0 ? ` · ${omitidos} omitido${omitidos === 1 ? "" : "s"}` : ""}
         </div>
+        <div className="flex items-center justify-between mt-2 pt-2" style={{ borderTop: `1px dashed ${C.line}` }}>
+          <span style={{ fontSize: 11, color: C.inkSoft }}>Gastado en esta lista (sin IVA)</span>
+          <span style={{ fontSize: 14, fontWeight: 700, color: C.accent }}>
+            {cargandoServidor ? <Loader2 size={13} className="animate-spin inline" /> : fmtMoneda(gastoLista)}
+          </span>
+        </div>
       </div>
 
       {Object.entries(porProveedor).map(([prov, list]) => (
@@ -2068,15 +2222,17 @@ function ListaTab({ items, onSave, showToast }) {
             {list.map((item, idx) => {
               const status = statusOf(item);
               const s = STATUS_STYLE[status];
-              const isChecked = !!checked[item.id];
-              const isOmitido = checked[item.id] === "omitido";
+              const est = estadoPorLinea[item.id];
+              const isChecked = !!est;
+              const isOmitido = est?.estado === "omitido";
               const colorMarca = isOmitido ? C.inkSoft : C.accent;
+              const precio = precios[insumoKeyOf(item)];
               return (
                 <button
                   key={item.id}
-                  onClick={() => (isChecked ? destacharSinComprar(item.id) : setComprando(item))}
+                  onClick={() => (isChecked ? setDesmarcando(item) : setComprando(item))}
                   className="w-full flex items-center gap-3 px-4 py-3 text-left"
-                  style={{ borderTop: idx > 0 ? `1px solid ${C.line}` : "none", opacity: isChecked ? 0.5 : 1 }}
+                  style={{ borderTop: idx > 0 ? `1px solid ${C.line}` : "none", opacity: isChecked ? 0.55 : 1 }}
                 >
                   <div
                     className="w-5 h-5 rounded-md flex items-center justify-center flex-shrink-0"
@@ -2090,6 +2246,10 @@ function ListaTab({ items, onSave, showToast }) {
                       {isOmitido ? (
                         <span className="px-1.5 py-0.5 rounded" style={{ fontSize: 10, background: C.bg, color: C.inkSoft, border: `1px solid ${C.line}`, fontFamily: "'IBM Plex Mono', monospace" }}>
                           Omitido
+                        </span>
+                      ) : isChecked ? (
+                        <span className="px-1.5 py-0.5 rounded" style={{ fontSize: 10, background: C.okBg, color: C.ok, fontFamily: "'IBM Plex Mono', monospace" }}>
+                          {est.costo != null ? `Comprado · ${fmtMoneda(est.costo)}` : est.local ? "Comprado (sin costo)" : "Comprado"}
                         </span>
                       ) : (
                         <span className="px-1.5 py-0.5 rounded" style={{ fontSize: 10, background: s.bg, color: s.color, fontFamily: "'IBM Plex Mono', monospace" }}>
@@ -2105,6 +2265,11 @@ function ListaTab({ items, onSave, showToast }) {
                         </span>
                       )}
                     </div>
+                    {!isChecked && precio && (
+                      <div style={{ fontSize: 10.5, color: C.inkSoft, marginTop: 2, fontFamily: "'IBM Plex Mono', monospace" }}>
+                        última compra {fmtMoneda(precio.costo_unitario)}/{item.unidad}
+                      </div>
+                    )}
                   </div>
                   <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontWeight: 700, fontSize: 15, color: C.accent }}>
                     {fmtNum(item.faltante)} <span style={{ fontSize: 10, fontWeight: 500, color: C.inkSoft }}>{item.unidad}</span>
@@ -2117,50 +2282,184 @@ function ListaTab({ items, onSave, showToast }) {
       ))}
 
       {comprando && (
-        <ComprarModal item={comprando} onCancelar={() => setComprando(null)} onConfirmar={registrarCompra} onOmitir={omitir} />
+        <ComprarModal
+          item={comprando}
+          presentaciones={presentaciones.filter((p) => p.insumo_key === insumoKeyOf(comprando))}
+          precio={precios[insumoKeyOf(comprando)]}
+          onCancelar={() => setComprando(null)}
+          onConfirmar={registrarCompra}
+          onOmitir={omitir}
+        />
+      )}
+      {desmarcando && (
+        <ConfirmAccion
+          text={`¿Desmarcar "${desmarcando.nombre}"? Se anula el costo registrado de esta compra. El inventario NO cambia.`}
+          confirmLabel="Desmarcar"
+          confirmColor={C.critical}
+          onCancel={() => setDesmarcando(null)}
+          onConfirm={() => confirmarDesmarcar(desmarcando)}
+        />
       )}
     </div>
   );
 }
 
-function ComprarModal({ item, onCancelar, onConfirmar, onOmitir }) {
+const CONTADAS_POR_PIEZA = ["pza", "caja", "paquete", "botella"];
+
+function ComprarModal({ item, presentaciones, precio, onCancelar, onConfirmar, onOmitir }) {
   useAtras(true, onCancelar);
-  const [cantidad, setCantidad] = useState(String(item.faltante));
+  const unidad = item.unidad;
+  const base = { nombre: `${unidad} (suelto)`, contenido: 1 };
+
+  // Opciones: "suelto" + las guardadas. Se preselecciona la de la última compra.
+  const opciones = useMemo(() => {
+    const lista = [base, ...presentaciones.map((p) => ({ nombre: p.nombre, contenido: Number(p.contenido) }))];
+    const vistos = new Set();
+    return lista.filter((o) => (vistos.has(o.nombre) ? false : (vistos.add(o.nombre), true)));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [presentaciones, unidad]);
+
+  const inicial = opciones.find((o) => o.nombre === precio?.presentacion_nombre) || opciones[0];
+  const [sel, setSel] = useState(inicial.nombre); // nombre de la presentación o "__nueva"
+  const [nuevaNombre, setNuevaNombre] = useState("");
+  const [nuevaContenido, setNuevaContenido] = useState("");
+  const [produccion, setProduccion] = useState(esProduccionInterna(item));
+  const [conIva, setConIva] = useState(false);
+  const [costo, setCosto] = useState("");
+
+  const presentacion = sel === "__nueva"
+    ? { nombre: nuevaNombre.trim(), contenido: Number(nuevaContenido), nueva: true }
+    : (opciones.find((o) => o.nombre === sel) || base);
+
+  function sugerida(p) {
+    if (!p || !(p.contenido > 0)) return "";
+    const n = item.faltante / p.contenido;
+    return String(CONTADAS_POR_PIEZA.includes(unidad) || p.contenido !== 1 ? Math.max(1, Math.ceil(n - 0.001)) : Math.round(n * 10) / 10);
+  }
+  const [cantidad, setCantidad] = useState(sugerida(inicial));
+
+  function elegir(nombre) {
+    setSel(nombre);
+    if (nombre !== "__nueva") setCantidad(sugerida(opciones.find((o) => o.nombre === nombre)));
+  }
+
+  const cant = Number(cantidad);
+  const presentacionValida = presentacion.nombre && presentacion.contenido > 0;
+  const unidades = presentacionValida && cant > 0 ? Math.round(cant * presentacion.contenido * 1000) / 1000 : 0;
+  const costoNum = Number(costo);
+  const costoSinIva = costoNum > 0 ? (conIva ? costoNum / (1 + IVA) : costoNum) : 0;
+  const unitario = unidades > 0 && costoSinIva > 0 ? costoSinIva / unidades : null;
+  const cambio = unitario != null && precio?.costo_unitario > 0 ? (unitario - precio.costo_unitario) / precio.costo_unitario : null;
+
+  const listo = presentacionValida && cant > 0 && (produccion || costoNum > 0);
+
+  function confirmar() {
+    if (!listo) return;
+    onConfirmar(item, { cantidadPresentaciones: cant, presentacion, costoTotal: costoNum, conIva, produccion });
+  }
+
+  const lbl = { fontSize: 12, color: C.inkSoft, fontWeight: 600, marginBottom: 4, display: "block" };
+  const chip = (activo) => ({
+    fontSize: 12.5, padding: "7px 11px", borderRadius: 999, fontWeight: 600,
+    border: `1.5px solid ${activo ? C.accent : C.line}`, background: activo ? C.accent : C.paper, color: activo ? "#fff" : C.ink,
+  });
+  const input = { border: `1px solid ${C.line}`, background: C.bg, color: C.ink };
 
   return (
     <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center p-4" style={{ background: "rgba(34,31,26,0.5)" }} onClick={onCancelar}>
-      <div className="w-full max-w-sm rounded-2xl p-5" style={{ background: C.paper }} onClick={(e) => e.stopPropagation()}>
+      <div className="w-full max-w-sm rounded-2xl p-5 overflow-y-auto" style={{ background: C.paper, maxHeight: "92vh" }} onClick={(e) => e.stopPropagation()}>
         <div className="flex items-center justify-between mb-1">
           <span style={{ fontFamily: "'Space Grotesk', sans-serif", fontWeight: 700, fontSize: 17 }}>{item.nombre}</span>
           <button onClick={onCancelar}><X size={20} style={{ color: C.inkSoft }} /></button>
         </div>
-        <p style={{ fontSize: 12, color: C.inkSoft, marginBottom: 14 }}>
-          Se necesitaba {fmtNum(item.faltante)} {item.unidad} (comprado o producido). Ajusta según lo que realmente entró — se suma directo a tu inventario.
+        <p style={{ fontSize: 12, color: C.inkSoft, marginBottom: 12 }}>
+          Faltaban {fmtNum(item.faltante)} {unidad}.
+          {precio ? ` Última compra: ${fmtMoneda(precio.costo_unitario)} por ${unidad}.` : " Aún no hay precio registrado."}
         </p>
-        <label style={{ fontSize: 12, color: C.inkSoft, fontWeight: 600, marginBottom: 4, display: "block" }}>
-          ¿Cuánto conseguiste o produjiste?
+
+        <label className="flex items-center gap-2 mb-3" style={{ fontSize: 12.5, color: C.ink }}>
+          <input type="checkbox" checked={produccion} onChange={(e) => setProduccion(e.target.checked)} />
+          Lo produjimos aquí (no se compró, sin costo)
         </label>
-        <div className="flex items-center gap-2 mb-4">
-          <input
-            autoFocus
-            type="number"
-            inputMode="decimal"
-            value={cantidad}
-            onChange={(e) => setCantidad(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && Number(cantidad) > 0 && onConfirmar(item, Number(cantidad))}
-            className="flex-1 px-3 py-3 rounded-xl text-2xl font-black text-center outline-none"
-            style={{ border: `1px solid ${C.line}`, background: C.bg, color: C.ink }}
-          />
-          <span style={{ fontSize: 14, fontWeight: 600, color: C.inkSoft, flexShrink: 0 }}>{item.unidad}</span>
+
+        <span style={lbl}>Presentación</span>
+        <div className="flex flex-wrap gap-1.5 mb-2">
+          {opciones.map((o) => (
+            <button key={o.nombre} type="button" onClick={() => elegir(o.nombre)} style={chip(sel === o.nombre)}>
+              {o.nombre}{o.contenido !== 1 ? ` · ${fmtNum(o.contenido)} ${unidad}` : ""}
+            </button>
+          ))}
+          <button type="button" onClick={() => elegir("__nueva")} style={chip(sel === "__nueva")}>
+            <Plus size={12} className="inline -mt-0.5" /> Otra presentación
+          </button>
         </div>
+        {sel === "__nueva" && (
+          <div className="rounded-xl p-3 mb-2" style={{ background: C.bg, border: `1px solid ${C.line}` }}>
+            <span style={lbl}>Nombre (ej. bolsa 5 kg, caja con 12)</span>
+            <input value={nuevaNombre} onChange={(e) => setNuevaNombre(e.target.value)} className="w-full px-3 py-2 rounded-lg mb-2 outline-none" style={{ ...input, background: C.paper }} placeholder="bolsa 5 kg" />
+            <span style={lbl}>¿Cuántos {unidad} trae cada una?</span>
+            <input type="number" inputMode="decimal" value={nuevaContenido} onChange={(e) => setNuevaContenido(e.target.value)} className="w-full px-3 py-2 rounded-lg outline-none" style={{ ...input, background: C.paper }} placeholder="5" />
+          </div>
+        )}
+
+        <span style={{ ...lbl, marginTop: 10 }}>¿Cuántas {sel === "__nueva" ? "de esta presentación" : `"${presentacion.nombre}"`} {produccion ? "produjiste" : "compraste"}?</span>
+        <input
+          type="number"
+          inputMode="decimal"
+          value={cantidad}
+          onChange={(e) => setCantidad(e.target.value)}
+          className="w-full px-3 py-3 rounded-xl text-2xl font-black text-center outline-none"
+          style={input}
+        />
+        <p style={{ fontSize: 11.5, color: C.accent, marginTop: 4, marginBottom: 10, fontWeight: 600 }}>
+          {unidades > 0 ? `Entran ${fmtNum(unidades)} ${unidad} al inventario` : " "}
+        </p>
+
+        {!produccion && (
+          <>
+            <span style={lbl}>Costo total pagado</span>
+            <div className="flex items-center gap-2">
+              <span style={{ fontSize: 20, fontWeight: 700, color: C.inkSoft }}>$</span>
+              <input
+                type="number"
+                inputMode="decimal"
+                value={costo}
+                onChange={(e) => setCosto(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && confirmar()}
+                className="flex-1 px-3 py-3 rounded-xl text-2xl font-black text-center outline-none"
+                style={input}
+                placeholder="0.00"
+              />
+            </div>
+            <label className="flex items-center gap-2 mt-2" style={{ fontSize: 12, color: C.inkSoft }}>
+              <input type="checkbox" checked={conIva} onChange={(e) => setConIva(e.target.checked)} />
+              Este monto trae IVA incluido (se le quita el 16%)
+            </label>
+            {unitario != null && (
+              <div className="rounded-xl px-3 py-2 mt-2" style={{ background: C.bg, fontSize: 12.5 }}>
+                <div>Sin IVA: <b>{fmtMoneda(costoSinIva)}</b> · por {unidad}: <b>{fmtMoneda(unitario)}</b></div>
+                {cambio != null && Math.abs(cambio) >= 0.005 && (
+                  <div style={{ color: cambio > 0.1 ? C.critical : cambio > 0 ? C.warn : C.ok, fontWeight: 600, marginTop: 2 }}>
+                    {cambio > 0 ? "▲ Subió" : "▼ Bajó"} {Math.abs(cambio * 100).toFixed(0)}% vs la última compra ({fmtMoneda(precio.costo_unitario)})
+                    {cambio > 0.1 ? " — revisa con el proveedor" : ""}
+                  </div>
+                )}
+              </div>
+            )}
+          </>
+        )}
+
         <button
-          onClick={() => onConfirmar(item, Number(cantidad))}
-          disabled={!cantidad || Number(cantidad) <= 0}
-          className="w-full py-3 rounded-xl font-semibold text-sm disabled:opacity-40"
+          onClick={confirmar}
+          disabled={!listo}
+          className="w-full py-3 mt-4 rounded-xl font-semibold text-sm disabled:opacity-40"
           style={{ background: C.accent, color: "#fff" }}
         >
-          Registrar entrada al inventario
+          {produccion ? "Registrar producción" : "Registrar compra"}
         </button>
+        {!listo && !produccion && cant > 0 && presentacionValida && (
+          <p style={{ fontSize: 10.5, color: C.inkSoft, marginTop: 6, textAlign: "center" }}>Escribe el costo para poder registrar la compra.</p>
+        )}
         {onOmitir && (
           <button
             onClick={() => onOmitir(item)}
@@ -2169,11 +2468,6 @@ function ComprarModal({ item, onCancelar, onConfirmar, onOmitir }) {
           >
             <X size={15} /> Omitir esta vez (no se compró)
           </button>
-        )}
-        {onOmitir && (
-          <p style={{ fontSize: 10.5, color: C.inkSoft, marginTop: 6, textAlign: "center" }}>
-            Omitir lo tacha de la lista sin sumar nada al inventario.
-          </p>
         )}
       </div>
     </div>
