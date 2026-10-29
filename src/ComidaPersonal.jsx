@@ -109,15 +109,21 @@ const MESES = ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "o
 function fechaBonita(s) { const d = deStr(s); return `${DIAS[d.getDay()]} ${d.getDate()} ${MESES[d.getMonth()]}`; }
 
 /* ---------- Ciclo ---------- */
+function leerIngredientes(texto) {
+  if (!texto) return [];
+  return texto.split("|").map((t) => {
+    const [insumo, cant, unidad] = t.split(":");
+    return { insumo, cantidad: parseFloat(cant), unidad };
+  });
+}
 function armarCiclo(lista) {
   return lista.map(([base, preps]) => ({
     base,
-    preps: preps.map(([nombre, preparacion, ing, costo]) => ({
-      nombre, preparacion, costo,
-      ingredientes: ing.split("|").map((t) => {
-        const [insumo, cant, unidad] = t.split(":");
-        return { insumo, cantidad: parseFloat(cant), unidad };
-      }),
+    preps: preps.map(([nombre, preparacion, ing, costo, libres = "", porcion = ""]) => ({
+      nombre, preparacion, costo, porcion,
+      ingredientes: leerIngredientes(ing),
+      /* Libres: tortillas y salsa al centro (se cuentan por persona para la lista de mañana) */
+      libres: leerIngredientes((CICLO.libres || {})[libres]),
     })),
   }));
 }
@@ -164,7 +170,7 @@ function insumosDelDia(est, fecha, hoy) {
     const t = queToca(est, tipo, fecha, hoy, true);
     if (!t.prep) return;
     const p = personasDe(est, fecha, tipo);
-    t.prep.ingredientes.forEach((g) => {
+    t.prep.ingredientes.concat(t.prep.libres).forEach((g) => {
       const k = g.insumo + "|" + g.unidad;
       total[k] = total[k] || { ...g, cantidad: 0 };
       total[k].cantidad += g.cantidad * p;
@@ -350,29 +356,26 @@ function TarjetaComida({ tipo, toca, est, hoy, fecha, personas, onPersonas, esHo
         {pesos(prep.costo)} por persona{prep.costo > tope ? <b style={{ color: C.warn }}> (arriba del tope ${tope})</b> : null}
         {" · "}<b style={{ color: C.ink }}>Total {pesos(prep.costo * personas)}</b>
       </div>
+      {prep.porcion && CICLO.porciones && CICLO.porciones[prep.porcion] ? (
+        <div className="mt-2 inline-block rounded-full px-2.5 py-1" style={{ fontSize: 11.5, fontWeight: 700, background: prep.porcion === "completa" ? C.accentSoft : C.okSoft, color: prep.porcion === "completa" ? C.accent : C.ok }}>
+          {CICLO.porciones[prep.porcion]}
+        </div>
+      ) : null}
 
       {/* Ingredientes multiplicados */}
       <div className="mt-3 rounded-xl overflow-hidden" style={{ border: `1px solid ${C.line}` }}>
         <div className="flex px-3 py-2" style={{ background: C.bg, fontSize: 11, fontWeight: 700, letterSpacing: "0.06em", textTransform: "uppercase", color: C.inkSoft }}>
           <span className="flex-1">Ingrediente</span><span className="w-20 text-right">x persona</span><span className="w-24 text-right">x {personas}</span>
         </div>
-        {prep.ingredientes.map((g) => {
-          const total = g.cantidad * personas;
-          const fraccion = (g.unidad === "pza" || g.unidad === "porción") && total % 1 !== 0;
-          return (
-            <div key={g.insumo} className="flex px-3 py-2 items-baseline" style={{ borderTop: `1px solid ${C.line}`, fontSize: 14 }}>
-              <span className="flex-1 min-w-0">
-                {g.insumo}
-                {CICLO.produccion.includes(g.insumo) ? <span style={{ fontSize: 10.5, color: C.ok, fontWeight: 700, marginLeft: 6 }}>DE DÍA</span> : null}
-              </span>
-              <span className="w-20 text-right" style={{ color: C.inkSoft, fontVariantNumeric: "tabular-nums" }}>{formatoCantidad(g.cantidad, g.unidad)}</span>
-              <span className="w-24 text-right font-bold" style={{ fontVariantNumeric: "tabular-nums" }}>
-                {formatoCantidad(total, g.unidad)}
-                {fraccion ? <div style={{ fontSize: 10.5, color: C.inkSoft, fontWeight: 500 }}>usar {Math.ceil(total)}</div> : null}
-              </span>
+        {prep.ingredientes.map((g) => <FilaIngrediente key={g.insumo} g={g} personas={personas} />)}
+        {prep.libres.length ? (
+          <>
+            <div className="px-3 py-2" style={{ background: C.bg, borderTop: `1px solid ${C.line}`, fontSize: 11, fontWeight: 700, letterSpacing: "0.06em", textTransform: "uppercase", color: C.inkSoft }}>
+              Libres (al centro)
             </div>
-          );
-        })}
+            {prep.libres.map((g) => <FilaIngrediente key={"lib" + g.insumo} g={g} personas={personas} />)}
+          </>
+        ) : null}
       </div>
 
       <button onClick={() => setVerPrep((v) => !v)} className="mt-3 flex items-center gap-1 text-sm font-bold" style={{ color: C.accent }}>
@@ -402,6 +405,24 @@ function TarjetaComida({ tipo, toca, est, hoy, fecha, personas, onPersonas, esHo
           </button>
         )
       ) : null}
+    </div>
+  );
+}
+
+function FilaIngrediente({ g, personas }) {
+  const total = g.cantidad * personas;
+  const fraccion = (g.unidad === "pza" || g.unidad === "porción") && total % 1 !== 0;
+  return (
+    <div className="flex px-3 py-2 items-baseline" style={{ borderTop: `1px solid ${C.line}`, fontSize: 14 }}>
+      <span className="flex-1 min-w-0">
+        {g.insumo}
+        {CICLO.produccion.includes(g.insumo) ? <span style={{ fontSize: 10.5, color: C.ok, fontWeight: 700, marginLeft: 6 }}>DE DÍA</span> : null}
+      </span>
+      <span className="w-20 text-right" style={{ color: C.inkSoft, fontVariantNumeric: "tabular-nums" }}>{formatoCantidad(g.cantidad, g.unidad)}</span>
+      <span className="w-24 text-right font-bold" style={{ fontVariantNumeric: "tabular-nums" }}>
+        {formatoCantidad(total, g.unidad)}
+        {fraccion ? <div style={{ fontSize: 10.5, color: C.inkSoft, fontWeight: 500 }}>usar {Math.ceil(total)}</div> : null}
+      </span>
     </div>
   );
 }
